@@ -57,8 +57,8 @@ else
 fi
 APP_NAME="${APP_NAME:-app}"
 
-echo "📦 File:     $BASENAME"
-echo "🏷  App name: $APP_NAME"
+echo "File:     $BASENAME"
+echo "App name: $APP_NAME"
 echo ""
 
 # ── detect type ───────────────────────────────────────────────────────────────
@@ -79,7 +79,7 @@ if [[ -z "$TYPE" ]]; then
     exit 1
 fi
 
-echo "⚙️  Type: $TYPE"
+echo "Type: $TYPE"
 
 # ── trap: send failure notification if script exits unexpectedly ──────────────
 # shellcheck disable=SC2154  # rc is assigned inside the trap via rc=$?
@@ -254,7 +254,7 @@ case "$TYPE" in
                 echo "▸ Icon extracted: $icon_dest"
             fi
         else
-            echo "⚠️  Could not extract icon from AppImage (non-fatal)"
+            echo "Warning: Could not extract icon from AppImage (non-fatal)"
         fi
         rm -rf "$TMP_DIR"
 
@@ -334,7 +334,7 @@ esac
 
 # ── refresh GNOME ─────────────────────────────────────────────────────────────
 update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
-echo "🔄 Desktop database updated. On Wayland, log out and back in for the launcher icon to appear."
+echo "Desktop database updated. On Wayland, log out and back in for the launcher icon to appear."
 
 # ── success notification ──────────────────────────────────────────────────────
 notify_success "$APP_NAME"

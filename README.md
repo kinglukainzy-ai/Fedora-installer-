@@ -1,4 +1,4 @@
-# Fedora Installer 🐧📦
+# Fedora Installer
 
 A universal **GUI + CLI** installer for Fedora/GNOME.
 Drop any installer file — `.rpm`, `.deb`, `.flatpak`, `.AppImage`, tarball, or `.zip` — and it handles the rest.

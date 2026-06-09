@@ -235,8 +235,8 @@ def install_file(path: str, app_name_override: str | None, log,
     app_name = app_name_override or app_name_from_path(path)
     # Sanitize: replace whitespace with hyphens for safe filesystem paths
     app_name = re.sub(r'\s+', '-', app_name)
-    log(f"📦 File type detected: {ftype}")
-    log(f"🏷  App name: {app_name}")
+    log(f"File type detected: {ftype}")
+    log(f"App name: {app_name}")
 
     def sudo_run(cmd: list[str], **kwargs):
         if cancel_token:
@@ -262,7 +262,7 @@ def install_file(path: str, app_name_override: str | None, log,
 
     # ── RPM ──────────────────────────────────────────────────────────────────
     if ftype == "rpm":
-        log("⚙️  Installing via dnf…")
+        log("Installing via dnf…")
         proc = sudo_run(["dnf", "install", "-y", path])
         _log_output(proc.stdout.decode(errors="replace"), log)
         if proc.returncode != 0:
@@ -274,7 +274,7 @@ def install_file(path: str, app_name_override: str | None, log,
     # ── DEB ──────────────────────────────────────────────────────────────────
     elif ftype == "deb":
         import tempfile, shutil
-        log("⚙️  Converting .deb → .rpm via alien…")
+        log("Converting .deb → .rpm via alien…")
         # Fix #4: use a temp dir so we never pollute CWD or fail on read-only dirs
         with tempfile.TemporaryDirectory() as tmpdir:
             conv = cancellable_run(
@@ -292,7 +292,7 @@ def install_file(path: str, app_name_override: str | None, log,
             if not rpm_files:
                 raise RuntimeError("alien did not produce an .rpm file.")
             rpm_path = os.path.join(tmpdir, rpm_files[0])
-            log(f"⚙️  Installing converted RPM: {rpm_path}")
+            log(f"Installing converted RPM: {rpm_path}")
             proc = sudo_run(["dnf", "install", "-y", rpm_path])
             _log_output(proc.stdout.decode(errors="replace"), log)
             if proc.returncode != 0:
@@ -301,7 +301,7 @@ def install_file(path: str, app_name_override: str | None, log,
 
     # ── FLATPAK ───────────────────────────────────────────────────────────────
     elif ftype == "flatpak":
-        log("⚙️  Installing Flatpak bundle…")
+        log("Installing Flatpak bundle…")
         proc = cancellable_run(
             ["flatpak", "install", "--user", "--noninteractive", path],
             token=cancel_token,
@@ -321,7 +321,7 @@ def install_file(path: str, app_name_override: str | None, log,
         dest = os.path.join(dest_dir, f"{app_name}.AppImage")
         shutil.copy2(path, dest)
         os.chmod(dest, 0o755)
-        log(f"⚙️  Copied to {dest}")
+        log(f"Copied to {dest}")
 
         # Fix #2: extract icon in a secure temp dir, not CWD
         # Fix #3: detect actual icon extension (.png or .svg) dynamically
@@ -344,9 +344,9 @@ def install_file(path: str, app_name_override: str | None, log,
                     os.makedirs(os.path.dirname(icon_dest), exist_ok=True)
                     shutil.copy2(raw_icon, icon_dest)
                     icon_path = icon_dest
-                    log(f"⚙️  Icon extracted: {icon_dest}")
+                    log(f"Icon extracted: {icon_dest}")
             else:
-                log("⚠️  Could not extract icon from AppImage (non-fatal)")
+                log("Warning: Could not extract icon from AppImage (non-fatal)")
 
         create_desktop_entry(app_name, dest, icon_path, log)
         log("✅ AppImage installed.")
@@ -354,7 +354,7 @@ def install_file(path: str, app_name_override: str | None, log,
     # ── TARBALL / ZIP ─────────────────────────────────────────────────────────
     elif ftype in ("tarball", "zip"):
         import tempfile, shutil
-        log("⚙️  Extracting archive…")
+        log("Extracting archive…")
 
         # Pre-flight disk space check — catch full disks before starting
         archive_size = os.path.getsize(path)
@@ -395,7 +395,7 @@ def install_file(path: str, app_name_override: str | None, log,
                 content_root = tmpdir
 
             install_dir = f"/opt/{app_name}"
-            log(f"⚙️  Installing to {install_dir}…")
+            log(f"Installing to {install_dir}…")
             proc2 = sudo_run(["mkdir", "-p", install_dir])
             if proc2.returncode != 0:
                 raise RuntimeError(f"Cannot create {install_dir}: {proc2.stderr.decode()}")
@@ -416,13 +416,13 @@ def install_file(path: str, app_name_override: str | None, log,
         # look for bundled install.sh
         install_sh = os.path.join(install_dir, "install.sh")
         if os.path.exists(install_sh):
-            log("⚙️  Found install.sh — running it…")
+            log("Found install.sh — running it…")
             proc_sh = cancellable_run(
                 ["bash", install_sh], token=cancel_token,
                 cwd=install_dir,
             )
             if proc_sh.returncode != 0:
-                log(f"⚠️  install.sh exited with code {proc_sh.returncode}")
+                log(f"Warning: install.sh exited with code {proc_sh.returncode}")
                 _log_output(proc_sh.stderr.decode(errors="replace"), log)
             else:
                 _log_output(proc_sh.stdout.decode(errors="replace"), log)
@@ -432,9 +432,9 @@ def install_file(path: str, app_name_override: str | None, log,
                 link = f"/usr/local/bin/{app_name}"
                 ln_proc = sudo_run(["ln", "-sf", exe, link])
                 if ln_proc.returncode != 0:
-                    log(f"⚠️  Symlink failed: {ln_proc.stderr.decode(errors='replace')}")
+                    log(f"Warning: Symlink failed: {ln_proc.stderr.decode(errors='replace')}")
                 else:
-                    log(f"⚙️  Symlinked executable → {link}")
+                    log(f"Symlinked executable → {link}")
             else:
                 exe = install_dir
 
@@ -457,7 +457,7 @@ def install_file(path: str, app_name_override: str | None, log,
          os.path.expanduser("~/.local/share/applications")],
         capture_output=True,
     )
-    log("🔄 Desktop database updated. On Wayland, log out and back in "
+    log("Desktop database updated. On Wayland, log out and back in "
         "for the launcher icon to appear.")
 
 
@@ -752,7 +752,7 @@ class InstallerWindow(Adw.ApplicationWindow):
     def _on_cancel(self, btn):
         """Cancel button handler — kill the running subprocess and abort."""
         if self._cancel_token and self._installing:
-            self._log("⛔ Cancelling installation…")
+            self._log("Cancelling installation…")
             self.cancel_btn.set_sensitive(False)
             self._cancel_token.cancel()
 
@@ -777,7 +777,7 @@ class InstallerWindow(Adw.ApplicationWindow):
         app_name = app_name_override or app_name_from_path(path)
         app_name = re.sub(r'\s+', '-', app_name)
         
-        self._log("🧹 Cleaning up partial installation...")
+        self._log("Cleaning up partial installation...")
         def cleanup_sudo(cmd: list[str]):
             if sudo_password:
                 subprocess.run(["sudo", "-S"] + cmd, input=(sudo_password + "\n").encode(), capture_output=True)
@@ -809,7 +809,7 @@ class InstallerWindow(Adw.ApplicationWindow):
         self.install_btn.set_sensitive(True)
 
         if success:
-            self._log("🎉 Installation complete!")
+            self._log("Installation complete!")
             dialog = Adw.MessageDialog(
                 transient_for=self,
                 heading="Installed!",
@@ -835,7 +835,7 @@ class InstallerWindow(Adw.ApplicationWindow):
         self.progress.set_visible(False)
         self.cancel_btn.set_visible(False)
         self.install_btn.set_sensitive(True)
-        self._log("⛔ Installation cancelled.")
+        self._log("Installation cancelled.")
         dialog = Adw.MessageDialog(
             transient_for=self,
             heading="Cancelled",
