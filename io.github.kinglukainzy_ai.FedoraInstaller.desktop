@@ -5,6 +5,6 @@ Exec=fedora-installer %f
 Icon=fedora-installer
 Type=Application
 Categories=System;PackageManager;
-MimeType=application/x-rpm;application/vnd.debian.binary-package;application/vnd.flatpak;application/x-tar;application/gzip;application/zip;
+MimeType=application/x-rpm;application/vnd.debian.binary-package;application/vnd.flatpak;application/vnd.appimage;application/x-tar;application/gzip;application/x-xz-compressed-tar;application/x-bzip-compressed-tar;application/x-zstd-compressed-tar;application/zip;
 StartupNotify=true
 Keywords=install;rpm;deb;flatpak;appimage;tar;zip;

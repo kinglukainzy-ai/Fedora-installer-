@@ -25,11 +25,11 @@ while IFS= read -r FILE; do
 
     # Run installer in a terminal so user can see output
     if command -v gnome-terminal &>/dev/null; then
-        gnome-terminal -- bash -c "
-            bash '$INSTALLER' '$FILE' '$APP_NAME';
-            echo '';
-            read -rp 'Press Enter to close...'
-        "
+        gnome-terminal -- bash -c '
+            bash "$1" "$2" "$3";
+            echo "";
+            read -rp "Press Enter to close..."
+        ' _ "$INSTALLER" "$FILE" "$APP_NAME"
     else
         bash "$INSTALLER" "$FILE" "$APP_NAME"
     fi

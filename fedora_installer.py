@@ -139,6 +139,8 @@ def install_file(path: str, app_name_override: str | None, log, sudo_password: s
     """
     ftype = detect_type(path)
     app_name = app_name_override or app_name_from_path(path)
+    # Sanitize: replace whitespace with hyphens for safe filesystem paths
+    app_name = re.sub(r'\s+', '-', app_name)
     log(f"📦 File type detected: {ftype}")
     log(f"🏷  App name: {app_name}")
 
@@ -244,7 +246,7 @@ def install_file(path: str, app_name_override: str | None, log, sudo_password: s
     # ── TARBALL / ZIP ─────────────────────────────────────────────────────────
     elif ftype in ("tarball", "zip"):
         import tempfile, shutil
-        log(f"⚙️  Extracting archive…")
+        log("⚙️  Extracting archive…")
 
         # Fix #1: extract to a temp dir first, then detect the actual root
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -278,7 +280,7 @@ def install_file(path: str, app_name_override: str | None, log, sudo_password: s
 
             # copy content_root into install_dir
             copy_proc = subprocess.run(
-                ["bash", "-c", f"cp -a '{content_root}/.' '{install_dir}/'"],
+                ["cp", "-a", content_root + "/.", install_dir + "/"],
                 capture_output=True,
             )
             if copy_proc.returncode != 0:
@@ -291,13 +293,24 @@ def install_file(path: str, app_name_override: str | None, log, sudo_password: s
         install_sh = os.path.join(install_dir, "install.sh")
         if os.path.exists(install_sh):
             log("⚙️  Found install.sh — running it…")
-            subprocess.run(["bash", install_sh], cwd=install_dir)
+            proc_sh = subprocess.run(
+                ["bash", install_sh], cwd=install_dir,
+                capture_output=True,
+            )
+            if proc_sh.returncode != 0:
+                log(f"⚠️  install.sh exited with code {proc_sh.returncode}")
+                log(proc_sh.stderr.decode(errors="replace"))
+            else:
+                log(proc_sh.stdout.decode(errors="replace"))
         else:
             exe = find_executable(install_dir)
             if exe:
                 link = f"/usr/local/bin/{app_name}"
-                sudo_run(["ln", "-sf", exe, link])
-                log(f"⚙️  Symlinked executable → {link}")
+                ln_proc = sudo_run(["ln", "-sf", exe, link])
+                if ln_proc.returncode != 0:
+                    log(f"⚠️  Symlink failed: {ln_proc.stderr.decode(errors='replace')}")
+                else:
+                    log(f"⚙️  Symlinked executable → {link}")
             else:
                 exe = install_dir
 
@@ -401,6 +414,12 @@ class InstallerWindow(Adw.ApplicationWindow):
         self.name_entry = Adw.EntryRow(title="Override app name")
         name_group.add(self.name_entry)
         content.append(name_group)
+
+        # ── sudo password entry ───────────────────────────────────────────────
+        pwd_group = Adw.PreferencesGroup(title="Sudo password (if needed)")
+        self.pwd_entry = Adw.PasswordEntryRow(title="Password for sudo operations")
+        pwd_group.add(self.pwd_entry)
+        content.append(pwd_group)
 
         # ── install button ────────────────────────────────────────────────────
         self.install_btn = Gtk.Button(label="Install")
@@ -533,13 +552,14 @@ class InstallerWindow(Adw.ApplicationWindow):
         self.install_btn.set_sensitive(False)
         self.progress.set_visible(True)
         app_name_override = self.name_entry.get_text().strip() or None
+        sudo_password = self.pwd_entry.get_text().strip() or None
 
         # pulse the progress bar on a timer
         self._pulse_id = GLib.timeout_add(100, self._pulse)
 
         thread = threading.Thread(
             target=self._install_thread,
-            args=(self._file_path, app_name_override),
+            args=(self._file_path, app_name_override, sudo_password),
             daemon=True,
         )
         thread.start()
@@ -548,9 +568,9 @@ class InstallerWindow(Adw.ApplicationWindow):
         self.progress.pulse()
         return self._installing
 
-    def _install_thread(self, path, app_name_override):
+    def _install_thread(self, path, app_name_override, sudo_password=None):
         try:
-            install_file(path, app_name_override, self._log)
+            install_file(path, app_name_override, self._log, sudo_password=sudo_password)
             GLib.idle_add(self._install_done, True, None)
         except Exception as e:
             GLib.idle_add(self._install_done, False, str(e))
@@ -565,7 +585,7 @@ class InstallerWindow(Adw.ApplicationWindow):
             dialog = Adw.MessageDialog(
                 transient_for=self,
                 heading="Installed!",
-                body=f"The app is now available in your GNOME launcher.",
+                body="The app is now available in your GNOME launcher.",
             )
             dialog.add_response("ok", "Great!")
             dialog.present()
@@ -587,9 +607,11 @@ class FedoraInstallerApp(Adw.Application):
         self.path_arg = None
 
     def do_activate(self):
-        win = InstallerWindow(application=self)
-        if self.path_arg:
-            win._set_file(self.path_arg)
+        win = self.get_active_window()
+        if win is None:
+            win = InstallerWindow(application=self)
+            if self.path_arg:
+                win._set_file(self.path_arg)
         win.present()
 
 
