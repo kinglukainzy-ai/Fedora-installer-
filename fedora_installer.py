@@ -70,12 +70,29 @@ Terminal=false
 
 
 def find_icon(directory: str) -> str | None:
+    # Fix #7: increased maxdepth equivalent — os.walk is unbounded, but we
+    # now prefer hicolor/256x256 paths and fall back to any .png/.svg/.xpm
+    best = None
     for root, _, files in os.walk(directory):
+        depth = root[len(directory):].count(os.sep)
+        if depth > 8:
+            continue
         for f in files:
             if f.lower().endswith((".png", ".svg", ".xpm")):
-                return os.path.join(root, f)
-    return None
+                full = os.path.join(root, f)
+                # prefer icons in standard hicolor or pixmaps directories
+                if any(p in root for p in ("hicolor", "pixmaps", "icons")):
+                    return full
+                if best is None:
+                    best = full
+    return best
 
+
+# Fix #6: excluded installer/setup/uninstall/config scripts from executable search
+_EXEC_EXCLUDE = re.compile(
+    r"(install|setup|uninstall|uninst|configure|config|postinst|prerm)(\.sh)?$",
+    re.IGNORECASE,
+)
 
 def find_executable(directory: str) -> str | None:
     """Find the most likely main executable in an extracted directory."""
@@ -83,12 +100,16 @@ def find_executable(directory: str) -> str | None:
     candidates = []
     for root, _, files in os.walk(directory):
         for f in files:
+            # Fix #6: skip installer/setup/uninstall/config scripts
+            if _EXEC_EXCLUDE.match(f):
+                continue
             full = os.path.join(root, f)
-            if os.access(full, os.X_OK) and not f.endswith((".so", ".so.0")):
+            if os.access(full, os.X_OK) and not re.search(r"\.so(\.\d+)*$", f):
                 score = 0
-                if f.lower() in (app_base, app_base.replace("-", ""), app_base.replace("_", "")):
+                fname = f.lower()
+                if fname in (app_base, app_base.replace("-", ""), app_base.replace("_", "")):
                     score = 10
-                elif "bin" in root:
+                elif "bin" in root.split(os.sep):
                     score = 5
                 candidates.append((score, full))
     if candidates:
@@ -129,23 +150,30 @@ def install_file(path: str, app_name_override: str | None, log, sudo_password: s
 
     # ── DEB ──────────────────────────────────────────────────────────────────
     elif ftype == "deb":
+        import tempfile, shutil
         log("⚙️  Converting .deb → .rpm via alien…")
-        conv = subprocess.run(["alien", "--to-rpm", "--scripts", path], capture_output=True)
-        log(conv.stdout.decode(errors="replace"))
-        if conv.returncode != 0:
-            raise RuntimeError(
-                "alien failed (is it installed? run: sudo dnf install -y alien)\n"
-                + conv.stderr.decode(errors="replace")
+        # Fix #4: use a temp dir so we never pollute CWD or fail on read-only dirs
+        with tempfile.TemporaryDirectory() as tmpdir:
+            conv = subprocess.run(
+                ["alien", "--to-rpm", "--scripts", path],
+                capture_output=True,
+                cwd=tmpdir,
             )
-        rpm_out = [f for f in os.listdir(".") if f.endswith(".rpm")]
-        if not rpm_out:
-            raise RuntimeError("alien did not produce an .rpm file.")
-        rpm_path = os.path.abspath(rpm_out[0])
-        log(f"⚙️  Installing converted RPM: {rpm_path}")
-        proc = sudo_run(["dnf", "install", "-y", rpm_path])
-        log(proc.stdout.decode(errors="replace"))
-        if proc.returncode != 0:
-            raise RuntimeError(proc.stderr.decode(errors="replace"))
+            log(conv.stdout.decode(errors="replace"))
+            if conv.returncode != 0:
+                raise RuntimeError(
+                    "alien failed (is it installed? run: sudo dnf install -y alien)\n"
+                    + conv.stderr.decode(errors="replace")
+                )
+            rpm_files = [f for f in os.listdir(tmpdir) if f.endswith(".rpm")]
+            if not rpm_files:
+                raise RuntimeError("alien did not produce an .rpm file.")
+            rpm_path = os.path.join(tmpdir, rpm_files[0])
+            log(f"⚙️  Installing converted RPM: {rpm_path}")
+            proc = sudo_run(["dnf", "install", "-y", rpm_path])
+            log(proc.stdout.decode(errors="replace"))
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr.decode(errors="replace"))
         log("✅ .deb converted and installed.")
 
     # ── FLATPAK ───────────────────────────────────────────────────────────────
@@ -162,35 +190,87 @@ def install_file(path: str, app_name_override: str | None, log, sudo_password: s
 
     # ── APPIMAGE ──────────────────────────────────────────────────────────────
     elif ftype == "appimage":
+        import tempfile, shutil
         dest_dir = os.path.expanduser("~/.local/bin")
         os.makedirs(dest_dir, exist_ok=True)
         dest = os.path.join(dest_dir, f"{app_name}.AppImage")
-        import shutil
         shutil.copy2(path, dest)
         os.chmod(dest, 0o755)
         log(f"⚙️  Copied to {dest}")
-        create_desktop_entry(app_name, dest, None, log)
+
+        # Fix #2: extract icon in a secure temp dir, not CWD
+        # Fix #3: detect actual icon extension (.png or .svg) dynamically
+        icon_path = None
+        with tempfile.TemporaryDirectory() as tmpdir:
+            extract = subprocess.run(
+                [dest, "--appimage-extract"],
+                capture_output=True,
+                cwd=tmpdir,
+            )
+            if extract.returncode == 0:
+                squash = os.path.join(tmpdir, "squashfs-root")
+                raw_icon = find_icon(squash)
+                if raw_icon:
+                    ext = os.path.splitext(raw_icon)[1]  # preserves .svg or .png
+                    icon_dest = os.path.join(
+                        os.path.expanduser("~/.local/share/icons"),
+                        f"{app_name}{ext}",
+                    )
+                    os.makedirs(os.path.dirname(icon_dest), exist_ok=True)
+                    shutil.copy2(raw_icon, icon_dest)
+                    icon_path = icon_dest
+                    log(f"⚙️  Icon extracted: {icon_dest}")
+            else:
+                log("⚠️  Could not extract icon from AppImage (non-fatal)")
+
+        create_desktop_entry(app_name, dest, icon_path, log)
         log("✅ AppImage installed.")
 
     # ── TARBALL / ZIP ─────────────────────────────────────────────────────────
     elif ftype in ("tarball", "zip"):
-        install_dir = f"/opt/{app_name}"
-        log(f"⚙️  Extracting to {install_dir}…")
-        proc = sudo_run(["mkdir", "-p", install_dir])
-        if proc.returncode != 0:
-            raise RuntimeError(f"Cannot create {install_dir}: {proc.stderr.decode()}")
+        import tempfile, shutil
+        log(f"⚙️  Extracting archive…")
 
-        if ftype == "tarball":
-            proc = sudo_run(["tar", "--strip-components=1", "-xf", path, "-C", install_dir])
-        else:
-            proc = subprocess.run(
-                ["unzip", "-o", path, "-d", install_dir],
+        # Fix #1: extract to a temp dir first, then detect the actual root
+        with tempfile.TemporaryDirectory() as tmpdir:
+            if ftype == "tarball":
+                # Fix #8: use plain -xf — GNU tar auto-detects compression
+                proc = subprocess.run(
+                    ["tar", "-xf", path, "-C", tmpdir],
+                    capture_output=True,
+                )
+            else:
+                proc = subprocess.run(
+                    ["unzip", "-o", path, "-d", tmpdir],
+                    capture_output=True,
+                )
+
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr.decode(errors="replace") or "extraction failed")
+
+            # Fix #1: determine the real content root
+            top_items = os.listdir(tmpdir)
+            if len(top_items) == 1 and os.path.isdir(os.path.join(tmpdir, top_items[0])):
+                content_root = os.path.join(tmpdir, top_items[0])
+            else:
+                content_root = tmpdir
+
+            install_dir = f"/opt/{app_name}"
+            log(f"⚙️  Installing to {install_dir}…")
+            proc2 = sudo_run(["mkdir", "-p", install_dir])
+            if proc2.returncode != 0:
+                raise RuntimeError(f"Cannot create {install_dir}: {proc2.stderr.decode()}")
+
+            # copy content_root into install_dir
+            copy_proc = subprocess.run(
+                ["bash", "-c", f"cp -a '{content_root}/.' '{install_dir}/'"],
                 capture_output=True,
             )
-
-        log(proc.stdout.decode(errors="replace") if hasattr(proc, "stdout") else "")
-        if proc.returncode != 0:
-            raise RuntimeError(proc.stderr.decode(errors="replace") if hasattr(proc, "stderr") else "extraction failed")
+            if copy_proc.returncode != 0:
+                # fallback: try with sudo
+                copy_proc = sudo_run(["cp", "-a", content_root + "/.", install_dir + "/"])
+                if copy_proc.returncode != 0:
+                    raise RuntimeError(copy_proc.stderr.decode(errors="replace") or "copy failed")
 
         # look for bundled install.sh
         install_sh = os.path.join(install_dir, "install.sh")
