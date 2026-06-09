@@ -9,12 +9,11 @@ echo ""
 
 # ── dependencies ──────────────────────────────────────────────────────────────
 echo "▸ Installing system dependencies…"
-sudo dnf install -y \
+sudo dnf install -y --skip-unavailable \
     python3 \
     python3-gobject \
     python3-gobject-base \
     libadwaita \
-    python3-libadwaita \
     gtk4 \
     flatpak \
     unzip \
@@ -35,13 +34,59 @@ echo ""
 echo "▸ Installing Fedora Installer to /usr/local/lib/fedora-installer…"
 sudo mkdir -p /usr/local/lib/fedora-installer
 sudo cp "$SCRIPT_DIR/fedora_installer.py" /usr/local/lib/fedora-installer/
+sudo cp "$SCRIPT_DIR/VERSION" /usr/local/lib/fedora-installer/VERSION
 
 # ── CLI launcher ──────────────────────────────────────────────────────────────
 echo "▸ Creating CLI launcher at /usr/local/bin/fedora-installer…"
-sudo tee /usr/local/bin/fedora-installer > /dev/null << 'EOF'
+sudo tee /usr/local/bin/fedora-installer > /dev/null << 'LAUNCHER'
 #!/usr/bin/env bash
-exec python3 /usr/local/lib/fedora-installer/fedora_installer.py "$@"
-EOF
+# Fedora Installer launcher — supports --update and --version flags
+set -euo pipefail
+
+INSTALL_DIR="/usr/local/lib/fedora-installer"
+REPO_URL="https://github.com/kinglukainzy-ai/Fedora-installer-"
+VERSION_URL="https://raw.githubusercontent.com/kinglukainzy-ai/Fedora-installer-/main/VERSION"
+
+if [[ "${1:-}" == "--version" ]]; then
+    CURRENT=$(cat "$INSTALL_DIR/VERSION" 2>/dev/null || echo "unknown")
+    echo "Fedora Installer v$CURRENT"
+    exit 0
+fi
+
+if [[ "${1:-}" == "--update" ]]; then
+    CURRENT=$(cat "$INSTALL_DIR/VERSION" 2>/dev/null || echo "0.0.0")
+    echo "Current version: $CURRENT"
+    echo "Checking for updates…"
+
+    LATEST=$(curl -fsSL --connect-timeout 10 "$VERSION_URL" 2>/dev/null | tr -d '[:space:]') || {
+        echo "❌ Could not reach GitHub. Check your internet connection."
+        exit 1
+    }
+
+    if [[ -z "$LATEST" ]]; then
+        echo "❌ Could not read remote version."
+        exit 1
+    fi
+
+    if [[ "$LATEST" == "$CURRENT" ]]; then
+        echo "✅ Already up to date ($CURRENT)."
+        exit 0
+    fi
+
+    echo "Updating $CURRENT → $LATEST …"
+    TMP=$(mktemp -d --tmpdir=/var/tmp)
+    trap 'rm -rf "$TMP"' EXIT
+
+    git clone --depth=1 "$REPO_URL" "$TMP/repo"
+    bash "$TMP/repo/smart-install-setup.sh"
+
+    echo ""
+    echo "✅ Updated to v$LATEST."
+    exit 0
+fi
+
+exec python3 "$INSTALL_DIR/fedora_installer.py" "$@"
+LAUNCHER
 sudo chmod +x /usr/local/bin/fedora-installer
 
 echo "▸ Installing CLI installer to ~/.local/bin/smart-install.sh…"
@@ -52,6 +97,10 @@ chmod +x ~/.local/bin/smart-install.sh
 # ── desktop entry ─────────────────────────────────────────────────────────────
 echo "▸ Installing application icon…"
 mkdir -p ~/.local/share/icons
+# Fix ownership if a prior sudo created this directory as root
+if [[ ! -w ~/.local/share/icons ]]; then
+    sudo chown -R "$(id -u):$(id -g)" ~/.local/share/icons
+fi
 cp "$SCRIPT_DIR/fedora-installer.png" ~/.local/share/icons/fedora-installer.png
 
 echo "▸ Creating desktop entry…"

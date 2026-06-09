@@ -14,9 +14,31 @@ import threading
 import os
 import sys
 import re
+import urllib.request
 
 APP_ID = "io.github.kinglukainzy_ai.FedoraInstaller"
-VERSION = "1.0.0"
+VERSION_FILE = "/usr/local/lib/fedora-installer/VERSION"
+try:
+    with open(VERSION_FILE) as _vf:
+        VERSION = _vf.read().strip()
+except OSError:
+    VERSION = "0.0.0"
+
+VERSION_URL = (
+    "https://raw.githubusercontent.com/kinglukainzy-ai/Fedora-installer-/main/VERSION"
+)
+
+
+def _log_output(text: str, log, max_lines: int = 20):
+    """Log subprocess output, collapsing excessive lines into a summary."""
+    lines = text.strip().splitlines()
+    if len(lines) > max_lines:
+        for l in lines[:max_lines]:
+            log(l)
+        log(f"… ({len(lines) - max_lines} more lines suppressed)")
+    else:
+        for l in lines:
+            log(l)
 
 
 # ─────────────────────────── backend installer ───────────────────────────────
@@ -160,7 +182,7 @@ def install_file(path: str, app_name_override: str | None, log, sudo_password: s
     if ftype == "rpm":
         log("⚙️  Installing via dnf…")
         proc = sudo_run(["dnf", "install", "-y", path])
-        log(proc.stdout.decode(errors="replace"))
+        _log_output(proc.stdout.decode(errors="replace"), log)
         if proc.returncode != 0:
             raise RuntimeError(proc.stderr.decode(errors="replace"))
         log("✅ RPM installed.")
@@ -176,7 +198,7 @@ def install_file(path: str, app_name_override: str | None, log, sudo_password: s
                 capture_output=True,
                 cwd=tmpdir,
             )
-            log(conv.stdout.decode(errors="replace"))
+            _log_output(conv.stdout.decode(errors="replace"), log)
             if conv.returncode != 0:
                 raise RuntimeError(
                     "alien failed (is it installed? run: sudo dnf install -y alien)\n"
@@ -188,7 +210,7 @@ def install_file(path: str, app_name_override: str | None, log, sudo_password: s
             rpm_path = os.path.join(tmpdir, rpm_files[0])
             log(f"⚙️  Installing converted RPM: {rpm_path}")
             proc = sudo_run(["dnf", "install", "-y", rpm_path])
-            log(proc.stdout.decode(errors="replace"))
+            _log_output(proc.stdout.decode(errors="replace"), log)
             if proc.returncode != 0:
                 raise RuntimeError(proc.stderr.decode(errors="replace"))
         log("✅ .deb converted and installed.")
@@ -200,7 +222,7 @@ def install_file(path: str, app_name_override: str | None, log, sudo_password: s
             ["flatpak", "install", "--user", "--noninteractive", path],
             capture_output=True,
         )
-        log(proc.stdout.decode(errors="replace"))
+        _log_output(proc.stdout.decode(errors="replace"), log)
         if proc.returncode != 0:
             raise RuntimeError(proc.stderr.decode(errors="replace"))
         log("✅ Flatpak installed.")
@@ -248,8 +270,22 @@ def install_file(path: str, app_name_override: str | None, log, sudo_password: s
         import tempfile, shutil
         log("⚙️  Extracting archive…")
 
-        # Fix #1: extract to a temp dir first, then detect the actual root
-        with tempfile.TemporaryDirectory() as tmpdir:
+        # Pre-flight disk space check — catch full disks before starting
+        archive_size = os.path.getsize(path)
+        stat_tmp = os.statvfs("/var/tmp")
+        stat_opt = os.statvfs("/opt")
+        free_tmp = stat_tmp.f_bavail * stat_tmp.f_frsize
+        free_opt = stat_opt.f_bavail * stat_opt.f_frsize
+        needed = archive_size * 3
+        if free_tmp < needed or free_opt < needed:
+            raise RuntimeError(
+                f"Not enough disk space. Need ~{needed // (1024**2)} MB free in both "
+                f"/var/tmp ({free_tmp // (1024**2)} MB available) and "
+                f"/opt ({free_opt // (1024**2)} MB available)."
+            )
+
+        # Extract to /var/tmp (real disk) instead of /tmp (tmpfs, RAM-limited)
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as tmpdir:
             if ftype == "tarball":
                 # Fix #8: use plain -xf — GNU tar auto-detects compression
                 proc = subprocess.run(
@@ -263,7 +299,7 @@ def install_file(path: str, app_name_override: str | None, log, sudo_password: s
                 )
 
             if proc.returncode != 0:
-                raise RuntimeError(proc.stderr.decode(errors="replace") or "extraction failed")
+                raise RuntimeError(proc.stderr.decode(errors="replace")[:500] or "extraction failed")
 
             # Fix #1: determine the real content root
             top_items = os.listdir(tmpdir)
@@ -301,7 +337,7 @@ def install_file(path: str, app_name_override: str | None, log, sudo_password: s
                 log(f"⚠️  install.sh exited with code {proc_sh.returncode}")
                 log(proc_sh.stderr.decode(errors="replace"))
             else:
-                log(proc_sh.stdout.decode(errors="replace"))
+                _log_output(proc_sh.stdout.decode(errors="replace"), log)
         else:
             exe = find_executable(install_dir)
             if exe:
@@ -354,6 +390,13 @@ class InstallerWindow(Adw.ApplicationWindow):
         header = Adw.HeaderBar()
         header.add_css_class("flat")
         root.append(header)
+
+        # ── update banner (hidden until a newer version is detected) ──────────
+        self.update_banner = Adw.Banner()
+        self.update_banner.set_button_label("How to update")
+        self.update_banner.set_revealed(False)
+        self.update_banner.connect("button-clicked", self._on_update_banner_clicked)
+        root.append(self.update_banner)
 
         # ── content ───────────────────────────────────────────────────────────
         scroll = Gtk.ScrolledWindow(vexpand=True)
@@ -473,6 +516,43 @@ class InstallerWindow(Adw.ApplicationWindow):
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
         )
+
+        # ── background update check ───────────────────────────────────────────
+        threading.Thread(target=self._check_for_update, daemon=True).start()
+
+    # ── update check ──────────────────────────────────────────────────────────
+
+    def _check_for_update(self):
+        """Non-blocking background check — silently ignored on any failure."""
+        try:
+            req = urllib.request.Request(VERSION_URL, method="GET")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                latest = resp.read().decode().strip()
+            if latest and latest != VERSION:
+                GLib.idle_add(self._show_update_banner, latest)
+        except Exception:
+            pass  # network down, timeout, 404 — all fine, just skip
+
+    def _show_update_banner(self, latest: str):
+        self.update_banner.set_title(
+            f"A new version is available: v{latest}  (you have v{VERSION})"
+        )
+        self.update_banner.set_revealed(True)
+        return False
+
+    def _on_update_banner_clicked(self, banner):
+        dialog = Adw.MessageDialog(
+            transient_for=self,
+            heading="Update Fedora Installer",
+            body=(
+                "Run this command in a terminal:\n\n"
+                "  fedora-installer --update\n\n"
+                "This will download the latest version from GitHub "
+                "and re-run the setup script automatically."
+            ),
+        )
+        dialog.add_response("ok", "Got it")
+        dialog.present()
 
     # ── drag-and-drop callbacks ───────────────────────────────────────────────
 

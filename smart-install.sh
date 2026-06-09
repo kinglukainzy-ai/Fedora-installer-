@@ -263,7 +263,20 @@ case "$TYPE" in
         ;;
 
     tarball|zip)
-        TMP_DIR=$(mktemp -d)
+        # Pre-flight disk space check
+        archive_size=$(stat -c%s "$FILE")
+        free_tmp=$(df --output=avail -B1 /var/tmp | tail -1)
+        free_opt=$(df --output=avail -B1 /opt | tail -1)
+        needed=$(( archive_size * 3 ))
+        if (( free_tmp < needed || free_opt < needed )); then
+            echo "❌ Not enough disk space."
+            echo "   Need ~$(( needed / 1024 / 1024 )) MB free in both /var/tmp and /opt."
+            echo "   /var/tmp has $(( free_tmp / 1024 / 1024 )) MB, /opt has $(( free_opt / 1024 / 1024 )) MB."
+            exit 1
+        fi
+
+        # Extract to /var/tmp (real disk) instead of /tmp (tmpfs, RAM-limited)
+        TMP_DIR=$(mktemp -d --tmpdir=/var/tmp)
         echo "▸ Extracting archive to temporary directory…"
         
         if [[ "$TYPE" == "tarball" ]]; then

@@ -11,6 +11,8 @@ Drop any installer file — `.rpm`, `.deb`, `.flatpak`, `.AppImage`, tarball, or
 
 - **One-click installs** — drag & drop or browse from the GTK4 GUI
 - **CLI installer** — headless `smart-install.sh` for terminal or scripting
+- **Self-updating** — run `fedora-installer --update` to pull the latest release from GitHub
+- **Automatic update check** — the GUI quietly checks for new versions on startup and shows a non-blocking banner if one is available
 - **Nautilus integration** — right-click any supported file → **Scripts → Smart Install**
 - **Desktop notifications** — success/failure alerts via `notify-send`
 - **Auto app-name detection** — strips version suffixes, arch tags, and extensions
@@ -58,8 +60,8 @@ The setup script:
 
 1. Installs all system dependencies (`python3-gobject`, `libadwaita`, `gtk4`, `flatpak`, `unzip`, `tar`, `libnotify`)
 2. Optionally installs `alien` for `.deb` support
-3. Copies `fedora_installer.py` to `/usr/local/lib/fedora-installer/`
-4. Creates a CLI launcher at `/usr/local/bin/fedora-installer`
+3. Copies `fedora_installer.py` and `VERSION` to `/usr/local/lib/fedora-installer/`
+4. Creates a CLI launcher at `/usr/local/bin/fedora-installer` (with built-in `--update` and `--version` flags)
 5. Installs `smart-install.sh` to `~/.local/bin/`
 6. Registers the `.desktop` entry and app icon
 7. Installs the Nautilus right-click script
@@ -83,6 +85,8 @@ fedora-installer ~/Downloads/someapp.tar.gz
 
 > **Note:** The sudo password field pipes to `sudo -S` and is only needed for operations that require root access (RPM/deb install, writing to `/opt/`, symlinking to `/usr/local/bin/`). AppImage and Flatpak installs are user-level and don't need it.
 
+On launch the GUI performs a **background version check** against the GitHub repo. If a newer version exists, a subtle banner appears at the top of the window with a "How to update" button — it never blocks you from using the app.
+
 ### CLI
 
 ```bash
@@ -97,6 +101,35 @@ Desktop notifications are sent on success or failure. The script uses `set -euo 
 Right-click any supported file → **Scripts** → **Smart Install**
 
 A Zenity dialog prompts for an optional app name override, then runs the installer in a `gnome-terminal` window so you can watch the output.
+
+---
+
+## Updating
+
+Fedora Installer includes a built-in self-update mechanism so you always have the latest fixes and features.
+
+### Check your current version
+
+```bash
+fedora-installer --version
+```
+
+### Update to the latest release
+
+```bash
+fedora-installer --update
+```
+
+This will:
+
+1. Fetch the latest `VERSION` from GitHub
+2. Compare it to your locally installed version
+3. If newer: `git clone --depth=1` the repo into a temp directory and re-run `smart-install-setup.sh`
+4. Clean up the temp directory automatically (even on failure, via an `EXIT` trap)
+
+If you're already up to date, it prints `✅ Already up to date` and exits.
+
+> **Tip:** The GUI also checks automatically on startup. If an update is available, a non-intrusive banner appears at the top of the window — click "How to update" for instructions.
 
 ---
 
@@ -126,10 +159,11 @@ The setup script (`smart-install-setup.sh`) installs all of these automatically.
 ## Project Structure
 
 ```
-├── fedora_installer.py                                 # GTK4/Adw GUI application (v1.0.0)
+├── fedora_installer.py                                 # GTK4/Adw GUI application
 ├── smart-install.sh                                    # CLI installer (no GUI needed)
 ├── Smart Install                                       # Nautilus right-click script
 ├── smart-install-setup.sh                              # One-time setup / dependency installer
+├── VERSION                                             # Semver string (e.g. 1.0.0) used by --update
 ├── io.github.kinglukainzy_ai.FedoraInstaller.desktop   # .desktop file with MIME types
 ├── fedora-installer.png                                # App icon
 └── README.md
