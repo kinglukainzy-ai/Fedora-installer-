@@ -9,7 +9,7 @@ INSTALLER="$HOME/.local/bin/smart-install.sh"
 
 if [[ ! -f "$INSTALLER" ]]; then
     zenity --error --title="Smart Install" \
-        --text="Installer not found at $INSTALLER\n\nRun setup first:\n  bash ~/smart-install-setup.sh"
+         --text="Installer not found at $INSTALLER\n\nRun setup first:\n  bash setup.sh (from the cloned repository)"
     exit 1
 fi
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# smart-install-setup.sh — run once to set up Fedora Installer
+# setup.sh — run once to set up Fedora Installer
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -79,7 +79,7 @@ if [[ "${1:-}" == "--update" ]]; then
     trap 'rm -rf "$TMP"' EXIT
 
     git clone --depth=1 "$REPO_URL" "$TMP/repo"
-    bash "$TMP/repo/smart-install-setup.sh"
+    bash "$TMP/repo/setup.sh"
 
     echo ""
     echo "✅ Updated to v$LATEST."

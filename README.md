@@ -52,8 +52,8 @@ For tarballs and zip files, both the GUI and CLI installers automatically:
 ```bash
 git clone https://github.com/kinglukainzy-ai/Fedora-installer-
 cd Fedora-installer-
-chmod +x smart-install-setup.sh
-bash smart-install-setup.sh
+chmod +x setup.sh
+./setup.sh
 ```
 
 The setup script:
@@ -124,7 +124,7 @@ This will:
 
 1. Fetch the latest `VERSION` from GitHub
 2. Compare it to your locally installed version
-3. If newer: `git clone --depth=1` the repo into a temp directory and re-run `smart-install-setup.sh`
+3. If newer: `git clone --depth=1` the repo into a temp directory and re-run `setup.sh`
 4. Clean up the temp directory automatically (even on failure, via an `EXIT` trap)
 
 If you're already up to date, it prints `✅ Already up to date` and exits.
@@ -152,7 +152,7 @@ If you're already up to date, it prints `✅ Already up to date` and exits.
 - `zenity` — for the Nautilus right-click dialog
 - `gnome-terminal` — for terminal output during Nautilus installs (falls back to inline execution)
 
-The setup script (`smart-install-setup.sh`) installs all of these automatically.
+The setup script (`setup.sh`) installs all of these automatically.
 
 ---
 
@@ -162,7 +162,8 @@ The setup script (`smart-install-setup.sh`) installs all of these automatically.
 ├── fedora_installer.py                                 # GTK4/Adw GUI application
 ├── smart-install.sh                                    # CLI installer (no GUI needed)
 ├── Smart Install                                       # Nautilus right-click script
-├── smart-install-setup.sh                              # One-time setup / dependency installer
+├── setup.sh                                            # One-time setup / dependency installer
+├── install.sh                                          # Symbolic link to setup.sh (convenience entry point)
 ├── VERSION                                             # Semver string (e.g. 1.0.0) used by --update
 ├── io.github.kinglukainzy_ai.FedoraInstaller.desktop   # .desktop file with MIME types
 ├── fedora-installer.png                                # App icon
