@@ -82,7 +82,7 @@ fi
 echo "⚙️  Type: $TYPE"
 
 # ── trap: send failure notification if script exits unexpectedly ──────────────
-trap 'if [[ $? -ne 0 ]]; then notify_failure "${APP_NAME:-}" "Something went wrong. Check the terminal for details."; fi; if [[ -n "${TMP_DIR:-}" && -d "$TMP_DIR" ]]; then rm -rf "$TMP_DIR"; fi' EXIT
+trap 'rc=$?; if [[ $rc -ne 0 ]]; then notify_failure "${APP_NAME:-}" "Something went wrong. Check the terminal for details."; fi; if [[ -n "${TMP_DIR:-}" && -d "$TMP_DIR" ]]; then rm -rf "$TMP_DIR"; fi' EXIT
 
 find_icon() {
     local dir="$1"
