@@ -182,7 +182,7 @@ If you're already up to date, it prints `✅ Already up to date` and exits.
 ## Requirements
 
 - **Fedora 38+** with GNOME
-- **Python 3.11+**, GTK4, libadwaita 1.2+, `python3-gobject`
+- **Python 3.11+**, GTK4, libadwaita, `python3-gobject`
 - `alien` — optional, for `.deb` → `.rpm` conversion
 - `zenity` — for the Nautilus right-click dialog
 - `gnome-terminal` — for terminal output during Nautilus installs (falls back to inline execution)

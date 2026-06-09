@@ -846,7 +846,6 @@ class InstallerWindow(Adw.ApplicationWindow):
 
         page_install = self.tab_view.append(scroll)
         page_install.set_title("Install")
-        page_install.set_closable(False)
 
         installed_scroll = Gtk.ScrolledWindow(vexpand=True)
         installed_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -854,7 +853,6 @@ class InstallerWindow(Adw.ApplicationWindow):
         
         page_installed = self.tab_view.append(installed_scroll)
         page_installed.set_title("Installed")
-        page_installed.set_closable(False)
 
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
         content.set_margin_top(32)
