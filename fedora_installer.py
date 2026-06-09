@@ -1307,7 +1307,7 @@ class InstallerWindow(Adw.ApplicationWindow):
             
             for r in receipts:
                 row = Adw.ActionRow()
-                row.set_title(r.get("app_name", "Unknown App"))
+                row.set_title(GLib.markup_escape_text(r.get("app_name", "Unknown App")))
                 
                 installed_at = r.get("installed_at", "")
                 try:
@@ -1317,7 +1317,7 @@ class InstallerWindow(Adw.ApplicationWindow):
                     
                 paths = r.get("paths", {})
                 path_val = paths.get("install_dir") or paths.get("desktop_entry") or r.get("package_name") or ""
-                row.set_subtitle(f"Installed: {date_str}  ·  {path_val}")
+                row.set_subtitle(GLib.markup_escape_text(f"Installed: {date_str}  ·  {path_val}"))
                 
                 itype = r.get("install_type", "unknown")
                 badge = Gtk.Label(label=itype.upper())
@@ -1457,8 +1457,8 @@ class InstallerWindow(Adw.ApplicationWindow):
             self.search_flatpak_group.set_visible(True)
             for item in flatpaks:
                 row = Adw.ActionRow()
-                row.set_title(item["name"])
-                row.set_subtitle(item["package_name"])
+                row.set_title(GLib.markup_escape_text(item["name"]))
+                row.set_subtitle(GLib.markup_escape_text(item["package_name"]))
                 
                 btn = Gtk.Button()
                 btn.set_icon_name("user-trash-symbolic")
@@ -1475,8 +1475,8 @@ class InstallerWindow(Adw.ApplicationWindow):
             self.search_appimage_group.set_visible(True)
             for item in appimages:
                 row = Adw.ActionRow()
-                row.set_title(item["name"])
-                row.set_subtitle(item["path"])
+                row.set_title(GLib.markup_escape_text(item["name"]))
+                row.set_subtitle(GLib.markup_escape_text(item["path"]))
                 
                 btn = Gtk.Button()
                 btn.set_icon_name("user-trash-symbolic")
@@ -1493,8 +1493,8 @@ class InstallerWindow(Adw.ApplicationWindow):
             self.search_manual_group.set_visible(True)
             for item in manual:
                 row = Adw.ActionRow()
-                row.set_title(item["name"])
-                row.set_subtitle(item["path"])
+                row.set_title(GLib.markup_escape_text(item["name"]))
+                row.set_subtitle(GLib.markup_escape_text(item["path"]))
                 
                 btn = Gtk.Button()
                 btn.set_icon_name("user-trash-symbolic")
@@ -1511,8 +1511,8 @@ class InstallerWindow(Adw.ApplicationWindow):
             self.search_dnf_group.set_visible(True)
             for item in dnf[:50]:
                 row = Adw.ActionRow()
-                row.set_title(item["name"])
-                row.set_subtitle(item.get("summary", ""))
+                row.set_title(GLib.markup_escape_text(item["name"]))
+                row.set_subtitle(GLib.markup_escape_text(item.get("summary", "")))
                 
                 btn = Gtk.Button()
                 btn.set_icon_name("user-trash-symbolic")
@@ -1626,9 +1626,7 @@ class InstallerWindow(Adw.ApplicationWindow):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         box.set_margin_top(8)
         
-        pwd_entry = Gtk.PasswordEntry()
-        pwd_entry.set_placeholder_text("Password")
-        pwd_entry.set_activates_default(True)
+        pwd_entry = Gtk.PasswordEntry(placeholder_text="Password")
         box.append(pwd_entry)
         
         dialog.set_extra_child(box)
