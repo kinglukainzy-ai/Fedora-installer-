@@ -6,7 +6,7 @@ Fedora Installer — universal GUI installer for .rpm, .deb, .flatpak,
 """
 
 # Fedora Installer — Universal app installer for Fedora/GNOME
-# Copyright (C) 2026  Lukeman (kinglukainzy-ai)
+# Copyright (C) 2026 Lukeman Nana Yaw Quansah <kinglukainzy@gmail.com>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
