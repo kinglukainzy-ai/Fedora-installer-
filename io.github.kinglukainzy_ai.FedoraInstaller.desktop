@@ -2,7 +2,7 @@
 Name=Fedora Installer
 Comment=Install .rpm, .deb, .flatpak, .AppImage, .tar and .zip files with one click
 Exec=fedora-installer %f
-Icon=system-software-install
+Icon=fedora-installer
 Type=Application
 Categories=System;PackageManager;
 MimeType=application/x-rpm;application/vnd.debian.binary-package;application/vnd.flatpak;application/x-tar;application/gzip;application/zip;

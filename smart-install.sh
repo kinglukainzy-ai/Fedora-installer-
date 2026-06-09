@@ -29,7 +29,7 @@ notify_success() {
     DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}" \
     notify-send \
         --app-name="Fedora Installer" \
-        --icon="system-software-install" \
+        --icon="fedora-installer" \
         --urgency=normal \
         "✅ $app installed" \
         "$app is ready — find it in your app launcher." 2>/dev/null || true

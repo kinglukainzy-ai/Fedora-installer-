@@ -49,14 +49,18 @@ cp "$SCRIPT_DIR/smart-install.sh" ~/.local/bin/smart-install.sh
 chmod +x ~/.local/bin/smart-install.sh
 
 # ── desktop entry ─────────────────────────────────────────────────────────────
+echo "▸ Installing application icon…"
+mkdir -p ~/.local/share/icons
+cp "$SCRIPT_DIR/fedora-installer.png" ~/.local/share/icons/fedora-installer.png
+
 echo "▸ Creating desktop entry…"
 mkdir -p ~/.local/share/applications
-cat > ~/.local/share/applications/fedora-installer.desktop << 'EOF'
+cat > ~/.local/share/applications/io.github.kinglukainzy_ai.FedoraInstaller.desktop << 'EOF'
 [Desktop Entry]
 Name=Fedora Installer
 Comment=Install .rpm, .deb, .flatpak, .AppImage, .tar and .zip files with one click
 Exec=fedora-installer %f
-Icon=system-software-install
+Icon=fedora-installer
 Type=Application
 Categories=System;PackageManager;
 MimeType=application/x-rpm;application/vnd.debian.binary-package;application/vnd.flatpak;application/x-tar;application/gzip;application/zip;
