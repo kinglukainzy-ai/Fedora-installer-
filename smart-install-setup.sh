@@ -34,6 +34,7 @@ echo ""
 echo "▸ Installing Fedora Installer to /usr/local/lib/fedora-installer…"
 sudo mkdir -p /usr/local/lib/fedora-installer
 sudo cp "$SCRIPT_DIR/fedora_installer.py" /usr/local/lib/fedora-installer/
+sudo chmod 644 /usr/local/lib/fedora-installer/fedora_installer.py
 sudo cp "$SCRIPT_DIR/VERSION" /usr/local/lib/fedora-installer/VERSION
 
 # ── CLI launcher ──────────────────────────────────────────────────────────────
@@ -95,12 +96,15 @@ cp "$SCRIPT_DIR/smart-install.sh" ~/.local/bin/smart-install.sh
 chmod +x ~/.local/bin/smart-install.sh
 
 # ── desktop entry ─────────────────────────────────────────────────────────────
+# Fix ownership if a prior sudo created these directories as root
+for dir in ~/.local/share/icons ~/.local/share/applications ~/.local/share/nautilus/scripts; do
+    mkdir -p "$dir"
+    if [[ -d "$dir" && ! -w "$dir" ]]; then
+        sudo chown -R "$(whoami)":"$(whoami)" "$dir"
+    fi
+done
+
 echo "▸ Installing application icon…"
-mkdir -p ~/.local/share/icons
-# Fix ownership if a prior sudo created this directory as root
-if [[ ! -w ~/.local/share/icons ]]; then
-    sudo chown -R "$(id -u):$(id -g)" ~/.local/share/icons
-fi
 cp "$SCRIPT_DIR/fedora-installer.png" ~/.local/share/icons/fedora-installer.png
 
 echo "▸ Creating desktop entry…"
@@ -133,6 +137,9 @@ echo ""
 echo "  Launch: fedora-installer"
 echo "  Or: right-click any installer file → Scripts → Smart Install"
 echo "  Or: open the app from your GNOME launcher"
+echo ""
+echo "  ⚠️  On Wayland (default since Fedora 34): log out and back in"
+echo "     for the launcher icon to appear."
 echo ""
 echo "  Restart Nautilus if the right-click menu doesn't appear:"
 echo "    nautilus -q && nautilus &"

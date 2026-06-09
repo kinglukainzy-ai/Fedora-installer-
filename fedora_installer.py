@@ -335,7 +335,7 @@ def install_file(path: str, app_name_override: str | None, log, sudo_password: s
             )
             if proc_sh.returncode != 0:
                 log(f"⚠️  install.sh exited with code {proc_sh.returncode}")
-                log(proc_sh.stderr.decode(errors="replace"))
+                _log_output(proc_sh.stderr.decode(errors="replace"), log)
             else:
                 _log_output(proc_sh.stdout.decode(errors="replace"), log)
         else:
@@ -363,11 +363,12 @@ def install_file(path: str, app_name_override: str | None, log, sudo_password: s
 
     # Refresh GNOME shell icon cache
     subprocess.run(
-        ["bash", "-c", "update-desktop-database ~/.local/share/applications 2>/dev/null; "
-                        "killall -HUP gnome-shell 2>/dev/null || true"],
+        ["update-desktop-database",
+         os.path.expanduser("~/.local/share/applications")],
         capture_output=True,
     )
-    log("🔄 GNOME launcher refreshed.")
+    log("🔄 Desktop database updated. On Wayland, log out and back in "
+        "for the launcher icon to appear.")
 
 
 # ─────────────────────────── GTK4 UI ─────────────────────────────────────────

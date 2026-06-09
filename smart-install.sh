@@ -334,8 +334,7 @@ esac
 
 # ── refresh GNOME ─────────────────────────────────────────────────────────────
 update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
-killall -HUP gnome-shell 2>/dev/null || true
-echo "🔄 GNOME launcher refreshed."
+echo "🔄 Desktop database updated. On Wayland, log out and back in for the launcher icon to appear."
 
 # ── success notification ──────────────────────────────────────────────────────
 notify_success "$APP_NAME"
