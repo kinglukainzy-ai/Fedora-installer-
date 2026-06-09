@@ -34,4 +34,4 @@ while IFS= read -r FILE; do
         bash "$INSTALLER" "$FILE" "$APP_NAME"
     fi
 
-done <<< "$NAUTILUS_SCRIPT_SELECTED_FILE_PATHS"
+done <<< "${NAUTILUS_SCRIPT_SELECTED_FILE_PATHS:-}"

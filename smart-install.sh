@@ -82,7 +82,7 @@ fi
 echo "⚙️  Type: $TYPE"
 
 # ── trap: send failure notification if script exits unexpectedly ──────────────
-trap 'if [[ $? -ne 0 ]]; then notify_failure "$APP_NAME" "Something went wrong. Check the terminal for details."; fi' EXIT
+trap 'if [[ $? -ne 0 ]]; then notify_failure "${APP_NAME:-}" "Something went wrong. Check the terminal for details."; fi' EXIT
 
 find_icon() {
     local dir="$1"
@@ -108,7 +108,7 @@ find_executable() {
     local app_base
     app_base=$(basename "$dir" | tr '[:upper:]' '[:lower:]')
     local best_exe=""
-    local best_score=-1
+    local best_score=-9999
 
     # We want to walk the directory
     # Exclude files matching: (install|setup|uninstall|uninst|configure|config|postinst|prerm)(\.sh)?$ (case-insensitive)
@@ -134,10 +134,30 @@ find_executable() {
             local app_base_no_hyphen="${app_base//-/}"
             local app_base_no_under="${app_base//_/}"
 
+            # 1. Name matching
             if [[ "$fname_lower" == "$app_base" || "$fname_lower" == "$app_base_no_hyphen" || "$fname_lower" == "$app_base_no_under" ]]; then
-                score=10
-            elif [[ "$file" =~ /bin/ ]]; then
-                score=5
+                score=$((score + 100))
+            elif [[ "$fname_lower" == *"$app_base"* ]]; then
+                score=$((score + 50))
+            fi
+            
+            # 2. Location
+            if [[ "$file" =~ /bin/ ]]; then
+                score=$((score + 30))
+            fi
+            
+            # 3. Depth penalty
+            local rel_path="${file#"$dir"}"
+            local slash_count
+            local temp="${rel_path//[^\/]/}"
+            slash_count="${#temp}"
+            local depth=$((slash_count - 1))
+            if (( depth < 0 )); then depth=0; fi
+            score=$((score - (depth * 2)))
+            
+            # 4. Prefer binaries over shell script wrappers
+            if [[ "$fname_lower" != *.sh ]]; then
+                score=$((score + 5))
             fi
             
             if (( score > best_score )); then
@@ -187,7 +207,6 @@ case "$TYPE" in
         (cd "$TMP_DIR" && alien --to-rpm --scripts "$FILE")
         
         # Check if alien produced an .rpm file in TMP_DIR
-        local rpm_files
         rpm_files=("$TMP_DIR"/*.rpm)
         if [[ ! -e "${rpm_files[0]}" ]]; then
             rm -rf "$TMP_DIR"
@@ -195,7 +214,7 @@ case "$TYPE" in
             exit 1
         fi
         
-        local rpm_path="${rpm_files[0]}"
+        rpm_path="${rpm_files[0]}"
         echo "▸ Installing converted RPM: $rpm_path via dnf…"
         sudo dnf install -y "$rpm_path"
         
@@ -218,19 +237,17 @@ case "$TYPE" in
         echo "▸ Copied to $DEST"
 
         # Try to extract icon from AppImage
-        local icon_path=""
-        local TMP_DIR
+        icon_path=""
         TMP_DIR=$(mktemp -d)
         # Execute --appimage-extract inside TMP_DIR to avoid junk files in CWD
         if (cd "$TMP_DIR" && "$DEST" --appimage-extract &>/dev/null); then
-            local raw_icon
             raw_icon=$(find_icon "$TMP_DIR/squashfs-root")
             if [[ -n "$raw_icon" ]]; then
                 # Get the extension of the icon
-                local ext="${raw_icon##*.}"
-                local icon_dest_dir="$HOME/.local/share/icons"
+                ext="${raw_icon##*.}"
+                icon_dest_dir="$HOME/.local/share/icons"
                 mkdir -p "$icon_dest_dir"
-                local icon_dest="$icon_dest_dir/$APP_NAME.$ext"
+                icon_dest="$icon_dest_dir/$APP_NAME.$ext"
                 cp "$raw_icon" "$icon_dest"
                 icon_path="$icon_dest"
                 echo "▸ Icon extracted: $icon_dest"
@@ -256,7 +273,6 @@ case "$TYPE" in
 
         # Determine the real content root
         # Check if there is exactly one item in TMP_DIR and it is a directory
-        local top_items
         top_items=("$TMP_DIR"/*)
         # Handle cases where glob didn't match anything
         if [[ -e "${top_items[0]}" ]]; then

@@ -99,6 +99,7 @@ def find_executable(directory: str) -> str | None:
     app_base = os.path.basename(directory).lower()
     candidates = []
     for root, _, files in os.walk(directory):
+        depth = root[len(directory):].count(os.sep)
         for f in files:
             # Fix #6: skip installer/setup/uninstall/config scripts
             if _EXEC_EXCLUDE.match(f):
@@ -107,10 +108,24 @@ def find_executable(directory: str) -> str | None:
             if os.access(full, os.X_OK) and not re.search(r"\.so(\.\d+)*$", f):
                 score = 0
                 fname = f.lower()
+                
+                # 1. Name matching
                 if fname in (app_base, app_base.replace("-", ""), app_base.replace("_", "")):
-                    score = 10
-                elif "bin" in root.split(os.sep):
-                    score = 5
+                    score += 100
+                elif app_base in fname:
+                    score += 50
+                
+                # 2. Location
+                if "bin" in root.split(os.sep):
+                    score += 30
+                
+                # 3. Depth penalty
+                score -= depth * 2
+                
+                # 4. Prefer binaries over shell script wrappers
+                if not fname.endswith(".sh"):
+                    score += 5
+                
                 candidates.append((score, full))
     if candidates:
         return sorted(candidates, key=lambda x: -x[0])[0][1]
@@ -481,11 +496,19 @@ class InstallerWindow(Adw.ApplicationWindow):
     # ── state helpers ─────────────────────────────────────────────────────────
 
     def _set_file(self, path: str):
+        if not path or not os.path.isfile(path):
+            self._log(f"❌ Error: Invalid or non-existent file path: {path}")
+            return
         self._file_path = path
         name = os.path.basename(path)
         ftype = detect_type(path)
         self.file_row.set_title(name)
-        self.file_row.set_subtitle(f"Type: {ftype}  ·  {os.path.getsize(path) // 1024} KB")
+        try:
+            size_kb = os.path.getsize(path) // 1024
+            size_str = f"  ·  {size_kb} KB"
+        except OSError:
+            size_str = ""
+        self.file_row.set_subtitle(f"Type: {ftype}{size_str}")
         self.drop_label.set_text(name)
         suggested = app_name_from_path(path)
         self.name_entry.set_text(suggested)
@@ -498,7 +521,7 @@ class InstallerWindow(Adw.ApplicationWindow):
             self.log_buffer.insert(end, text.strip() + "\n")
             # scroll to bottom
             adj = self.log_view.get_parent().get_vadjustment()
-            adj.set_value(adj.get_upper())
+            adj.set_value(adj.get_upper() - adj.get_page_size())
         GLib.idle_add(_append)
 
     # ── install ───────────────────────────────────────────────────────────────
@@ -561,10 +584,12 @@ class InstallerWindow(Adw.ApplicationWindow):
 class FedoraInstallerApp(Adw.Application):
     def __init__(self):
         super().__init__(application_id=APP_ID)
-        self.connect("activate", self._on_activate)
+        self.path_arg = None
 
-    def _on_activate(self, app):
-        win = InstallerWindow(application=app)
+    def do_activate(self):
+        win = InstallerWindow(application=self)
+        if self.path_arg:
+            win._set_file(self.path_arg)
         win.present()
 
 
@@ -572,15 +597,8 @@ def main():
     app = FedoraInstallerApp()
     # allow a file path as CLI argument
     if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
-        # open the window then pre-select the file
-        original_activate = app._on_activate
-        path_arg = sys.argv[1]
-        def activate_with_file(a):
-            win = InstallerWindow(application=a)
-            win._set_file(path_arg)
-            win.present()
-        app.connect("activate", activate_with_file)
-        sys.exit(app.run([]))
+        app.path_arg = sys.argv[1]
+        sys.exit(app.run([sys.argv[0]]))
     sys.exit(app.run(sys.argv))
 
 

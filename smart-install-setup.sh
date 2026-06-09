@@ -14,6 +14,7 @@ sudo dnf install -y \
     python3-gobject \
     python3-gobject-base \
     libadwaita \
+    python3-libadwaita \
     gtk4 \
     flatpak \
     unzip \
@@ -71,18 +72,11 @@ update-desktop-database ~/.local/share/applications 2>/dev/null || true
 # ── Nautilus right-click script ───────────────────────────────────────────────
 echo "▸ Installing Nautilus right-click script…"
 mkdir -p ~/.local/share/nautilus/scripts
-cat > ~/.local/share/nautilus/scripts/"Smart Install" << 'SCRIPT'
-#!/usr/bin/env bash
-# Right-click → Scripts → Smart Install
-IFS=$'\n'
-for filepath in $NAUTILUS_SCRIPT_SELECTED_FILE_PATHS; do
-    fedora-installer "$filepath"
-done
-SCRIPT
+cp "$SCRIPT_DIR/Smart Install" ~/.local/share/nautilus/scripts/"Smart Install"
 chmod +x ~/.local/share/nautilus/scripts/"Smart Install"
 
 # restart Nautilus to pick up the script
-nautilus -q 2>/dev/null && sleep 1 && nautilus --no-desktop &
+nautilus -q 2>/dev/null && sleep 1 && nautilus &
 
 echo ""
 echo "✅ All done!"
