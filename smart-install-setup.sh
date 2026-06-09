@@ -43,6 +43,11 @@ exec python3 /usr/local/lib/fedora-installer/fedora_installer.py "$@"
 EOF
 sudo chmod +x /usr/local/bin/fedora-installer
 
+echo "▸ Installing CLI installer to ~/.local/bin/smart-install.sh…"
+mkdir -p ~/.local/bin
+cp "$SCRIPT_DIR/smart-install.sh" ~/.local/bin/smart-install.sh
+chmod +x ~/.local/bin/smart-install.sh
+
 # ── desktop entry ─────────────────────────────────────────────────────────────
 echo "▸ Creating desktop entry…"
 mkdir -p ~/.local/share/applications
