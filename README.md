@@ -202,11 +202,26 @@ The setup script (`setup.sh`) installs all of these automatically.
 ├── VERSION                                             # Semver string (e.g. 1.0.0) used by --update
 ├── io.github.kinglukainzy_ai.FedoraInstaller.desktop   # .desktop file with MIME types
 ├── fedora-installer.png                                # App icon
+├── LICENSE                                             # GPL-3.0 license
 └── README.md
 ```
 
 ---
 
+## Contributing
+
+Issues and pull requests are welcome.
+Please open an issue first for major changes.
+
+---
+
+## Acknowledgements
+
+Built with [GTK4](https://gtk.org/) and [libadwaita](https://gnome.pages.gitlab.gnome.org/libadwaita/).
+Inspired by the lack of a universal installer on Fedora Linux.
+
+---
+
 ## License
 
-MIT
+This project is licensed under the **GNU General Public License v3.0** — see the [LICENSE](LICENSE) file for details.
