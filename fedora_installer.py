@@ -14,6 +14,7 @@ import threading
 import os
 import sys
 import re
+import signal
 import urllib.request
 
 APP_ID = "io.github.kinglukainzy_ai.FedoraInstaller"
@@ -39,6 +40,74 @@ def _log_output(text: str, log, max_lines: int = 20):
     else:
         for l in lines:
             log(l)
+
+
+class CancelledError(Exception):
+    """Raised when the user cancels an in-progress installation."""
+
+
+class CancelToken:
+    """Thread-safe cancellation token that can kill the active subprocess."""
+
+    def __init__(self):
+        self._cancelled = False
+        self._lock = threading.Lock()
+        self._active_proc: subprocess.Popen | None = None
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled
+
+    def cancel(self):
+        """Set the cancel flag and kill any running subprocess."""
+        with self._lock:
+            self._cancelled = True
+            proc = self._active_proc
+        if proc is not None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+    def check(self):
+        """Raise CancelledError if cancellation was requested."""
+        if self._cancelled:
+            raise CancelledError("Installation cancelled by user.")
+
+    def register(self, proc: subprocess.Popen):
+        """Register a subprocess so it can be killed on cancel."""
+        with self._lock:
+            self._active_proc = proc
+            if self._cancelled:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+
+    def unregister(self):
+        with self._lock:
+            self._active_proc = None
+
+
+def cancellable_run(cmd: list[str], token: CancelToken | None = None, **kwargs):
+    """Run a subprocess, killing it if the token is cancelled.
+
+    Uses Popen internally so the process can be terminated mid-flight.
+    Returns a CompletedProcess-like object.
+    """
+    if token:
+        token.check()
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs)
+    if token:
+        token.register(proc)
+    try:
+        stdout, stderr = proc.communicate()
+    finally:
+        if token:
+            token.unregister()
+    if token:
+        token.check()
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
 
 # ─────────────────────────── backend installer ───────────────────────────────
@@ -154,10 +223,13 @@ def find_executable(directory: str) -> str | None:
     return None
 
 
-def install_file(path: str, app_name_override: str | None, log, sudo_password: str | None = None):
+def install_file(path: str, app_name_override: str | None, log,
+                 sudo_password: str | None = None,
+                 cancel_token: CancelToken | None = None):
     """
     Core installer. Calls log(str) for progress. Raises on fatal error.
     sudo_password: if provided, piped into sudo -S.
+    cancel_token: if provided, checked between steps and used to kill subprocesses.
     """
     ftype = detect_type(path)
     app_name = app_name_override or app_name_from_path(path)
@@ -167,15 +239,25 @@ def install_file(path: str, app_name_override: str | None, log, sudo_password: s
     log(f"🏷  App name: {app_name}")
 
     def sudo_run(cmd: list[str], **kwargs):
+        if cancel_token:
+            cancel_token.check()
         if sudo_password:
-            proc = subprocess.run(
-                ["sudo", "-S"] + cmd,
-                input=(sudo_password + "\n").encode(),
-                capture_output=True,
-                **kwargs,
+            # sudo_run uses Popen directly to support cancellation
+            full_cmd = ["sudo", "-S"] + cmd
+            proc = subprocess.Popen(
+                full_cmd, stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs,
             )
+            if cancel_token:
+                cancel_token.register(proc)
+            try:
+                stdout, stderr = proc.communicate(input=(sudo_password + "\n").encode())
+            finally:
+                if cancel_token:
+                    cancel_token.unregister()
+            return subprocess.CompletedProcess(full_cmd, proc.returncode, stdout, stderr)
         else:
-            proc = subprocess.run(["sudo"] + cmd, capture_output=True, **kwargs)
+            return cancellable_run(["sudo"] + cmd, token=cancel_token, **kwargs)
         return proc
 
     # ── RPM ──────────────────────────────────────────────────────────────────
@@ -185,6 +267,8 @@ def install_file(path: str, app_name_override: str | None, log, sudo_password: s
         _log_output(proc.stdout.decode(errors="replace"), log)
         if proc.returncode != 0:
             raise RuntimeError(proc.stderr.decode(errors="replace"))
+        if cancel_token:
+            cancel_token.check()
         log("✅ RPM installed.")
 
     # ── DEB ──────────────────────────────────────────────────────────────────
@@ -193,9 +277,9 @@ def install_file(path: str, app_name_override: str | None, log, sudo_password: s
         log("⚙️  Converting .deb → .rpm via alien…")
         # Fix #4: use a temp dir so we never pollute CWD or fail on read-only dirs
         with tempfile.TemporaryDirectory() as tmpdir:
-            conv = subprocess.run(
+            conv = cancellable_run(
                 ["alien", "--to-rpm", "--scripts", path],
-                capture_output=True,
+                token=cancel_token,
                 cwd=tmpdir,
             )
             _log_output(conv.stdout.decode(errors="replace"), log)
@@ -218,13 +302,15 @@ def install_file(path: str, app_name_override: str | None, log, sudo_password: s
     # ── FLATPAK ───────────────────────────────────────────────────────────────
     elif ftype == "flatpak":
         log("⚙️  Installing Flatpak bundle…")
-        proc = subprocess.run(
+        proc = cancellable_run(
             ["flatpak", "install", "--user", "--noninteractive", path],
-            capture_output=True,
+            token=cancel_token,
         )
         _log_output(proc.stdout.decode(errors="replace"), log)
         if proc.returncode != 0:
             raise RuntimeError(proc.stderr.decode(errors="replace"))
+        if cancel_token:
+            cancel_token.check()
         log("✅ Flatpak installed.")
 
     # ── APPIMAGE ──────────────────────────────────────────────────────────────
@@ -241,9 +327,9 @@ def install_file(path: str, app_name_override: str | None, log, sudo_password: s
         # Fix #3: detect actual icon extension (.png or .svg) dynamically
         icon_path = None
         with tempfile.TemporaryDirectory() as tmpdir:
-            extract = subprocess.run(
+            extract = cancellable_run(
                 [dest, "--appimage-extract"],
-                capture_output=True,
+                token=cancel_token,
                 cwd=tmpdir,
             )
             if extract.returncode == 0:
@@ -288,14 +374,14 @@ def install_file(path: str, app_name_override: str | None, log, sudo_password: s
         with tempfile.TemporaryDirectory(dir="/var/tmp") as tmpdir:
             if ftype == "tarball":
                 # Fix #8: use plain -xf — GNU tar auto-detects compression
-                proc = subprocess.run(
+                proc = cancellable_run(
                     ["tar", "-xf", path, "-C", tmpdir],
-                    capture_output=True,
+                    token=cancel_token,
                 )
             else:
-                proc = subprocess.run(
+                proc = cancellable_run(
                     ["unzip", "-o", path, "-d", tmpdir],
-                    capture_output=True,
+                    token=cancel_token,
                 )
 
             if proc.returncode != 0:
@@ -314,10 +400,12 @@ def install_file(path: str, app_name_override: str | None, log, sudo_password: s
             if proc2.returncode != 0:
                 raise RuntimeError(f"Cannot create {install_dir}: {proc2.stderr.decode()}")
 
+            if cancel_token:
+                cancel_token.check()
             # copy content_root into install_dir
-            copy_proc = subprocess.run(
+            copy_proc = cancellable_run(
                 ["cp", "-a", content_root + "/.", install_dir + "/"],
-                capture_output=True,
+                token=cancel_token,
             )
             if copy_proc.returncode != 0:
                 # fallback: try with sudo
@@ -329,9 +417,9 @@ def install_file(path: str, app_name_override: str | None, log, sudo_password: s
         install_sh = os.path.join(install_dir, "install.sh")
         if os.path.exists(install_sh):
             log("⚙️  Found install.sh — running it…")
-            proc_sh = subprocess.run(
-                ["bash", install_sh], cwd=install_dir,
-                capture_output=True,
+            proc_sh = cancellable_run(
+                ["bash", install_sh], token=cancel_token,
+                cwd=install_dir,
             )
             if proc_sh.returncode != 0:
                 log(f"⚠️  install.sh exited with code {proc_sh.returncode}")
@@ -362,6 +450,8 @@ def install_file(path: str, app_name_override: str | None, log, sudo_password: s
         )
 
     # Refresh GNOME shell icon cache
+    if cancel_token:
+        cancel_token.check()
     subprocess.run(
         ["update-desktop-database",
          os.path.expanduser("~/.local/share/applications")],
@@ -382,6 +472,7 @@ class InstallerWindow(Adw.ApplicationWindow):
 
         self._file_path: str | None = None
         self._installing = False
+        self._cancel_token: CancelToken | None = None
 
         # ── root box ──────────────────────────────────────────────────────────
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
@@ -465,14 +556,24 @@ class InstallerWindow(Adw.ApplicationWindow):
         pwd_group.add(self.pwd_entry)
         content.append(pwd_group)
 
-        # ── install button ────────────────────────────────────────────────────
+        # ── install / cancel button row ────────────────────────────────────────
+        btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        btn_row.set_halign(Gtk.Align.CENTER)
+        content.append(btn_row)
+
         self.install_btn = Gtk.Button(label="Install")
-        self.install_btn.set_halign(Gtk.Align.CENTER)
         self.install_btn.add_css_class("pill")
         self.install_btn.add_css_class("suggested-action")
         self.install_btn.set_sensitive(False)
         self.install_btn.connect("clicked", self._on_install)
-        content.append(self.install_btn)
+        btn_row.append(self.install_btn)
+
+        self.cancel_btn = Gtk.Button(label="Cancel")
+        self.cancel_btn.add_css_class("pill")
+        self.cancel_btn.add_css_class("destructive-action")
+        self.cancel_btn.set_visible(False)
+        self.cancel_btn.connect("clicked", self._on_cancel)
+        btn_row.append(self.cancel_btn)
 
         # ── progress ──────────────────────────────────────────────────────────
         self.progress = Gtk.ProgressBar()
@@ -630,7 +731,10 @@ class InstallerWindow(Adw.ApplicationWindow):
         if not self._file_path or self._installing:
             return
         self._installing = True
+        self._cancel_token = CancelToken()
         self.install_btn.set_sensitive(False)
+        self.cancel_btn.set_visible(True)
+        self.cancel_btn.set_sensitive(True)
         self.progress.set_visible(True)
         app_name_override = self.name_entry.get_text().strip() or None
         sudo_password = self.pwd_entry.get_text().strip() or None
@@ -645,20 +749,63 @@ class InstallerWindow(Adw.ApplicationWindow):
         )
         thread.start()
 
+    def _on_cancel(self, btn):
+        """Cancel button handler — kill the running subprocess and abort."""
+        if self._cancel_token and self._installing:
+            self._log("⛔ Cancelling installation…")
+            self.cancel_btn.set_sensitive(False)
+            self._cancel_token.cancel()
+
     def _pulse(self):
         self.progress.pulse()
         return self._installing
 
     def _install_thread(self, path, app_name_override, sudo_password=None):
         try:
-            install_file(path, app_name_override, self._log, sudo_password=sudo_password)
+            install_file(path, app_name_override, self._log,
+                         sudo_password=sudo_password,
+                         cancel_token=self._cancel_token)
             GLib.idle_add(self._install_done, True, None)
+        except CancelledError:
+            self._cleanup_partial(path, app_name_override, sudo_password)
+            GLib.idle_add(self._install_cancelled)
         except Exception as e:
             GLib.idle_add(self._install_done, False, str(e))
 
+    def _cleanup_partial(self, path, app_name_override, sudo_password):
+        ftype = detect_type(path)
+        app_name = app_name_override or app_name_from_path(path)
+        app_name = re.sub(r'\s+', '-', app_name)
+        
+        self._log("🧹 Cleaning up partial installation...")
+        def cleanup_sudo(cmd: list[str]):
+            if sudo_password:
+                subprocess.run(["sudo", "-S"] + cmd, input=(sudo_password + "\n").encode(), capture_output=True)
+            else:
+                subprocess.run(["sudo"] + cmd, capture_output=True)
+
+        if ftype in ("rpm", "deb"):
+            cleanup_sudo(["dnf", "remove", "-y", app_name])
+        elif ftype == "appimage":
+            dest = os.path.expanduser(f"~/.local/bin/{app_name}.AppImage")
+            try: os.remove(dest)
+            except OSError: pass
+            desktop_file = os.path.expanduser(f"~/.local/share/applications/{app_name.lower().replace(' ', '-')}.desktop")
+            try: os.remove(desktop_file)
+            except OSError: pass
+        elif ftype in ("tarball", "zip"):
+            cleanup_sudo(["rm", "-rf", f"/opt/{app_name}"])
+            link = f"/usr/local/bin/{app_name}"
+            cleanup_sudo(["rm", "-f", link])
+            desktop_file = os.path.expanduser(f"~/.local/share/applications/{app_name.lower().replace(' ', '-')}.desktop")
+            try: os.remove(desktop_file)
+            except OSError: pass
+
     def _install_done(self, success: bool, error: str | None):
         self._installing = False
+        self._cancel_token = None
         self.progress.set_visible(False)
+        self.cancel_btn.set_visible(False)
         self.install_btn.set_sensitive(True)
 
         if success:
@@ -679,6 +826,23 @@ class InstallerWindow(Adw.ApplicationWindow):
             )
             dialog.add_response("ok", "OK")
             dialog.present()
+        return False
+
+    def _install_cancelled(self):
+        """Called on the main thread when the install thread exits via cancel."""
+        self._installing = False
+        self._cancel_token = None
+        self.progress.set_visible(False)
+        self.cancel_btn.set_visible(False)
+        self.install_btn.set_sensitive(True)
+        self._log("⛔ Installation cancelled.")
+        dialog = Adw.MessageDialog(
+            transient_for=self,
+            heading="Cancelled",
+            body="The installation was cancelled. Partial files may remain.",
+        )
+        dialog.add_response("ok", "OK")
+        dialog.present()
         return False
 
 
