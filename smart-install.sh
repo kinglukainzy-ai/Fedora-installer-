@@ -254,7 +254,7 @@ case "$TYPE" in
                 echo "▸ Icon extracted: $icon_dest"
             fi
         else
-            echo "Warning: Could not extract icon from AppImage (non-fatal)"
+            echo "⚠️  Could not extract icon from AppImage (non-fatal)"
         fi
         rm -rf "$TMP_DIR"
 

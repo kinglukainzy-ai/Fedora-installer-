@@ -346,7 +346,7 @@ def install_file(path: str, app_name_override: str | None, log,
                     icon_path = icon_dest
                     log(f"Icon extracted: {icon_dest}")
             else:
-                log("Warning: Could not extract icon from AppImage (non-fatal)")
+                log("⚠️  Could not extract icon from AppImage (non-fatal)")
 
         create_desktop_entry(app_name, dest, icon_path, log)
         log("✅ AppImage installed.")
@@ -422,7 +422,7 @@ def install_file(path: str, app_name_override: str | None, log,
                 cwd=install_dir,
             )
             if proc_sh.returncode != 0:
-                log(f"Warning: install.sh exited with code {proc_sh.returncode}")
+                log(f"⚠️  install.sh exited with code {proc_sh.returncode}")
                 _log_output(proc_sh.stderr.decode(errors="replace"), log)
             else:
                 _log_output(proc_sh.stdout.decode(errors="replace"), log)
@@ -432,7 +432,7 @@ def install_file(path: str, app_name_override: str | None, log,
                 link = f"/usr/local/bin/{app_name}"
                 ln_proc = sudo_run(["ln", "-sf", exe, link])
                 if ln_proc.returncode != 0:
-                    log(f"Warning: Symlink failed: {ln_proc.stderr.decode(errors='replace')}")
+                    log(f"⚠️  Symlink failed: {ln_proc.stderr.decode(errors='replace')}")
                 else:
                     log(f"Symlinked executable → {link}")
             else:
