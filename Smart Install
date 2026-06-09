@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Smart Install (Nautilus Script)
+# Place in: ~/.local/share/nautilus/scripts/Smart Install
+# Then: chmod +x ~/.local/share/nautilus/scripts/"Smart Install"
+# =============================================================================
+
+INSTALLER="$HOME/.local/bin/smart-install.sh"
+
+if [[ ! -f "$INSTALLER" ]]; then
+    zenity --error --title="Smart Install" \
+        --text="Installer not found at $INSTALLER\n\nRun setup first:\n  bash ~/smart-install-setup.sh"
+    exit 1
+fi
+
+# NAUTILUS_SCRIPT_SELECTED_FILE_PATHS has one file per line
+while IFS= read -r FILE; do
+    [[ -z "$FILE" ]] && continue
+
+    # Ask for optional app name override
+    APP_NAME=$(zenity --entry \
+        --title="Smart Install" \
+        --text="Installing: $(basename "$FILE")\n\nApp name (leave blank to auto-detect):" \
+        --entry-text="" 2>/dev/null)
+
+    # Run installer in a terminal so user can see output
+    if command -v gnome-terminal &>/dev/null; then
+        gnome-terminal -- bash -c "
+            bash '$INSTALLER' '$FILE' '$APP_NAME';
+            echo '';
+            read -rp 'Press Enter to close...'
+        "
+    else
+        bash "$INSTALLER" "$FILE" "$APP_NAME"
+    fi
+
+done <<< "$NAUTILUS_SCRIPT_SELECTED_FILE_PATHS"
