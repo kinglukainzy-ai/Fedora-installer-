@@ -193,11 +193,44 @@ EOF
     echo "✔ Desktop entry: $desktop_dir/${clean_name}.desktop"
 }
 
+write_receipt() {
+    local app="$1" type="$2" install_dir="${3:-null}" symlink="${4:-null}" desktop_entry="${5:-null}" icon="${6:-null}" pkg_name="${7:-null}"
+    local receipts_dir="$HOME/.local/share/fedora-installer/receipts"
+    mkdir -p "$receipts_dir"
+    local receipt_file="$receipts_dir/${app,,}.json"
+    receipt_file="${receipt_file// /-}"
+    
+    json_val() {
+        if [[ "$1" == "null" || -z "$1" ]]; then
+            echo "null"
+        else
+            echo "\"$1\""
+        fi
+    }
+    
+    cat > "$receipt_file" << EOF
+{
+  "app_name": "$app",
+  "install_type": "$type",
+  "installed_at": "$(date -Iseconds)",
+  "paths": {
+    "install_dir": $(json_val "$install_dir"),
+    "symlink": $(json_val "$symlink"),
+    "desktop_entry": $(json_val "$desktop_entry"),
+    "icon": $(json_val "$icon")
+  },
+  "package_name": $(json_val "$pkg_name")
+}
+EOF
+}
+
 case "$TYPE" in
     rpm)
         echo "▸ Installing via dnf…"
+        PKG_NAME=$(rpm -qp --qf "%{NAME}" "$FILE" 2>/dev/null || true)
         sudo dnf install -y "$FILE"
         echo "✅ RPM installed."
+        write_receipt "$APP_NAME" "rpm" "null" "null" "null" "null" "$PKG_NAME"
         ;;
 
     deb)
@@ -216,17 +249,21 @@ case "$TYPE" in
         fi
         
         rpm_path="${rpm_files[0]}"
+        PKG_NAME=$(rpm -qp --qf "%{NAME}" "$rpm_path" 2>/dev/null || true)
         echo "▸ Installing converted RPM: $rpm_path via dnf…"
         sudo dnf install -y "$rpm_path"
         
         rm -rf "$TMP_DIR"
         echo "✅ .deb converted and installed."
+        write_receipt "$APP_NAME" "deb" "null" "null" "null" "null" "$PKG_NAME"
         ;;
 
     flatpak)
         echo "▸ Installing Flatpak bundle…"
+        PKG_NAME=$(flatpak info --show-metadata "$FILE" 2>/dev/null | grep -E '^name=' | cut -d= -f2 || true)
         flatpak install --user --noninteractive "$FILE"
         echo "✅ Flatpak installed."
+        write_receipt "$APP_NAME" "flatpak" "null" "null" "null" "null" "$PKG_NAME"
         ;;
 
     appimage)
@@ -260,6 +297,10 @@ case "$TYPE" in
 
         create_desktop_entry "$APP_NAME" "$DEST" "$icon_path"
         echo "✅ AppImage installed."
+        
+        clean_name="${APP_NAME,,}"
+        clean_name="${clean_name// /-}"
+        write_receipt "$APP_NAME" "appimage" "$DEST" "null" "$HOME/.local/share/applications/${clean_name}.desktop" "$icon_path" "null"
         ;;
 
     tarball|zip)
@@ -313,6 +354,9 @@ case "$TYPE" in
 
         # Look for bundled install.sh
         INSTALL_SH="$INSTALL_DIR/install.sh"
+        symlink_path=""
+        desktop_path=""
+        icon_path=""
         if [[ -f "$INSTALL_SH" ]]; then
             echo "▸ Found install.sh — running…"
             (cd "$INSTALL_DIR" && sudo bash install.sh)
@@ -321,14 +365,20 @@ case "$TYPE" in
             if [[ -n "$EXE" ]]; then
                 sudo ln -sf "$EXE" "/usr/local/bin/$APP_NAME"
                 echo "▸ Symlinked: /usr/local/bin/$APP_NAME → $EXE"
+                symlink_path="/usr/local/bin/$APP_NAME"
             else
                 EXE="$INSTALL_DIR"
             fi
             
             ICON=$(find_icon "$INSTALL_DIR")
+            icon_path="$ICON"
             create_desktop_entry "$APP_NAME" "$EXE" "$ICON"
+            clean_name="${APP_NAME,,}"
+            clean_name="${clean_name// /-}"
+            desktop_path="$HOME/.local/share/applications/${clean_name}.desktop"
         fi
         echo "✅ Archive installed."
+        write_receipt "$APP_NAME" "$TYPE" "$INSTALL_DIR" "$symlink_path" "$desktop_path" "$icon_path" "null"
         ;;
 esac
 

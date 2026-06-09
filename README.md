@@ -10,6 +10,9 @@ Drop any installer file — `.rpm`, `.deb`, `.flatpak`, `.AppImage`, tarball, or
 ## Features
 
 - **One-click installs** — drag & drop or browse from the GTK4 GUI
+- **One-click uninstalls** — manage and remove apps from the **Installed** tab
+- **Receipt tracking** — every install writes a JSON receipt so removal is clean and complete
+- **System-wide search** — find and remove DNF packages, Flatpaks, AppImages, and `/opt/` installs from one place
 - **CLI installer** — headless `smart-install.sh` for terminal or scripting
 - **Self-updating** — run `fedora-installer --update` to pull the latest release from GitHub
 - **Automatic update check** — the GUI quietly checks for new versions on startup and shows a non-blocking banner if one is available
@@ -44,6 +47,38 @@ For tarballs and zip files, both the GUI and CLI installers automatically:
 - **Create a `.desktop` entry** so the app appears in GNOME's launcher
 - **Symlink the executable** to `/usr/local/bin/<appname>` for terminal access
 - **Refresh GNOME's icon cache** automatically
+
+---
+
+## Uninstalling / Managing Apps
+
+The GUI includes a dedicated **Installed** tab with two sections:
+
+### Section A — Installed by Fedora Installer
+
+Every successful install (GUI or CLI) writes a JSON receipt to `~/.local/share/fedora-installer/receipts/`. The Installed tab lists these with colored badges (RPM, DEB, Flatpak, AppImage, Tarball, ZIP) and a trash-can button for one-click removal.
+
+| Format | What gets removed |
+|---|---|
+| RPM / DEB | `dnf remove <package_name>` |
+| Flatpak | `flatpak uninstall --user <app_id>` |
+| AppImage | Binary in `~/.local/bin/` + icon + `.desktop` entry |
+| Tarball / ZIP | `/opt/<appname>/` + `/usr/local/bin/<appname>` symlink + icon + `.desktop` entry |
+
+After successful removal the receipt file is automatically deleted.
+
+### Section B — Search All Installed Apps
+
+A live search box queries across **four sources** simultaneously:
+
+1. **Flatpak** — user and system `flatpak list --app --json`
+2. **AppImages** — `~/.local/bin/*.AppImage`
+3. **Manual** — directories under `/opt/`
+4. **DNF** — `rpm -qa` with summary matching
+
+Results appear grouped by type with individual remove buttons. A confirmation dialog (with an extra "Destructive Action Warning" for `/opt/` directories) precedes every removal. Operations requiring root prompt for a sudo password inline.
+
+> **Note:** Apps not installed via Fedora Installer won't have receipts, so removal is best-effort for AppImage/Manual and clean for DNF/Flatpak.
 
 ---
 

@@ -16,6 +16,10 @@ import sys
 import re
 import signal
 import urllib.request
+import json
+import shutil
+import tempfile
+from datetime import datetime
 
 APP_ID = "io.github.kinglukainzy_ai.FedoraInstaller"
 VERSION_FILE = "/usr/local/lib/fedora-installer/VERSION"
@@ -158,6 +162,7 @@ Terminal=false
     os.chmod(desktop_file, 0o755)
     subprocess.run(["update-desktop-database", desktop_dir], capture_output=True)
     log(f"✔ Desktop entry created: {desktop_file}")
+    return desktop_file
 
 
 def find_icon(directory: str) -> str | None:
@@ -223,6 +228,27 @@ def find_executable(directory: str) -> str | None:
     return None
 
 
+def write_receipt(app_name: str, install_type: str, paths: dict, package_name: str | None = None):
+    """Write a JSON receipt of the installation to ~/.local/share/fedora-installer/receipts/"""
+    receipts_dir = os.path.expanduser("~/.local/share/fedora-installer/receipts")
+    os.makedirs(receipts_dir, exist_ok=True)
+    receipt = {
+        "app_name": app_name,
+        "install_type": install_type,
+        "installed_at": datetime.now().isoformat(),
+        "paths": {
+            "install_dir": paths.get("install_dir"),
+            "symlink": paths.get("symlink"),
+            "desktop_entry": paths.get("desktop_entry"),
+            "icon": paths.get("icon")
+        },
+        "package_name": package_name
+    }
+    receipt_file = os.path.join(receipts_dir, f"{app_name.lower().replace(' ', '-')}.json")
+    with open(receipt_file, "w") as f:
+        json.dump(receipt, f, indent=2)
+
+
 def install_file(path: str, app_name_override: str | None, log,
                  sudo_password: str | None = None,
                  cancel_token: CancelToken | None = None):
@@ -263,6 +289,15 @@ def install_file(path: str, app_name_override: str | None, log,
     # ── RPM ──────────────────────────────────────────────────────────────────
     if ftype == "rpm":
         log("Installing via dnf…")
+        package_name = None
+        try:
+            pkg_proc = cancellable_run(["rpm", "-qp", "--qf", "%{NAME}", path], token=cancel_token)
+            if pkg_proc.returncode == 0:
+                package_name = pkg_proc.stdout.decode(errors="replace").strip()
+                log(f"Queried RPM package name: {package_name}")
+        except Exception as e:
+            log(f"⚠️  Could not query RPM package name: {e}")
+
         proc = sudo_run(["dnf", "install", "-y", path])
         _log_output(proc.stdout.decode(errors="replace"), log)
         if proc.returncode != 0:
@@ -270,10 +305,10 @@ def install_file(path: str, app_name_override: str | None, log,
         if cancel_token:
             cancel_token.check()
         log("✅ RPM installed.")
+        write_receipt(app_name, "rpm", {}, package_name)
 
     # ── DEB ──────────────────────────────────────────────────────────────────
     elif ftype == "deb":
-        import tempfile, shutil
         log("Converting .deb → .rpm via alien…")
         # Fix #4: use a temp dir so we never pollute CWD or fail on read-only dirs
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -292,12 +327,23 @@ def install_file(path: str, app_name_override: str | None, log,
             if not rpm_files:
                 raise RuntimeError("alien did not produce an .rpm file.")
             rpm_path = os.path.join(tmpdir, rpm_files[0])
+            
+            package_name = None
+            try:
+                pkg_proc = cancellable_run(["rpm", "-qp", "--qf", "%{NAME}", rpm_path], token=cancel_token)
+                if pkg_proc.returncode == 0:
+                    package_name = pkg_proc.stdout.decode(errors="replace").strip()
+                    log(f"Queried converted RPM package name: {package_name}")
+            except Exception as e:
+                log(f"⚠️  Could not query converted RPM package name: {e}")
+
             log(f"Installing converted RPM: {rpm_path}")
             proc = sudo_run(["dnf", "install", "-y", rpm_path])
             _log_output(proc.stdout.decode(errors="replace"), log)
             if proc.returncode != 0:
                 raise RuntimeError(proc.stderr.decode(errors="replace"))
         log("✅ .deb converted and installed.")
+        write_receipt(app_name, "deb", {}, package_name)
 
     # ── FLATPAK ───────────────────────────────────────────────────────────────
     elif ftype == "flatpak":
@@ -306,16 +352,33 @@ def install_file(path: str, app_name_override: str | None, log,
             ["flatpak", "install", "--user", "--noninteractive", path],
             token=cancel_token,
         )
-        _log_output(proc.stdout.decode(errors="replace"), log)
+        stdout_str = proc.stdout.decode(errors="replace")
+        _log_output(stdout_str, log)
         if proc.returncode != 0:
             raise RuntimeError(proc.stderr.decode(errors="replace"))
         if cancel_token:
             cancel_token.check()
+
+        package_name = None
+        try:
+            candidates = re.findall(r'\b[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)+\b', stdout_str)
+            filtered = [
+                c for c in candidates 
+                if not any(r in c for r in (".Platform", ".Sdk", ".Locale", ".BaseApp", ".BaseExtension"))
+            ]
+            if filtered:
+                package_name = filtered[-1]
+                log(f"Detected Flatpak application ID: {package_name}")
+            else:
+                log("⚠️  Could not detect Flatpak application ID from installation output.")
+        except Exception as e:
+            log(f"⚠️  Error parsing Flatpak ID: {e}")
+
         log("✅ Flatpak installed.")
+        write_receipt(app_name, "flatpak", {}, package_name)
 
     # ── APPIMAGE ──────────────────────────────────────────────────────────────
     elif ftype == "appimage":
-        import tempfile, shutil
         dest_dir = os.path.expanduser("~/.local/bin")
         os.makedirs(dest_dir, exist_ok=True)
         dest = os.path.join(dest_dir, f"{app_name}.AppImage")
@@ -348,12 +411,16 @@ def install_file(path: str, app_name_override: str | None, log,
             else:
                 log("⚠️  Could not extract icon from AppImage (non-fatal)")
 
-        create_desktop_entry(app_name, dest, icon_path, log)
+        desktop_path = create_desktop_entry(app_name, dest, icon_path, log)
         log("✅ AppImage installed.")
+        write_receipt(app_name, "appimage", {
+            "install_dir": dest,
+            "desktop_entry": desktop_path,
+            "icon": icon_path
+        })
 
     # ── TARBALL / ZIP ─────────────────────────────────────────────────────────
     elif ftype in ("tarball", "zip"):
-        import tempfile, shutil
         log("Extracting archive…")
 
         # Pre-flight disk space check — catch full disks before starting
@@ -415,6 +482,10 @@ def install_file(path: str, app_name_override: str | None, log,
 
         # look for bundled install.sh
         install_sh = os.path.join(install_dir, "install.sh")
+        symlink_path = None
+        desktop_path = None
+        icon_path = None
+
         if os.path.exists(install_sh):
             log("Found install.sh — running it…")
             proc_sh = cancellable_run(
@@ -435,13 +506,20 @@ def install_file(path: str, app_name_override: str | None, log,
                     log(f"⚠️  Symlink failed: {ln_proc.stderr.decode(errors='replace')}")
                 else:
                     log(f"Symlinked executable → {link}")
+                    symlink_path = link
             else:
                 exe = install_dir
 
-            icon = find_icon(install_dir)
-            create_desktop_entry(app_name, exe or install_dir, icon, log)
+            icon_path = find_icon(install_dir)
+            desktop_path = create_desktop_entry(app_name, exe or install_dir, icon_path, log)
 
         log("✅ Archive installed.")
+        write_receipt(app_name, ftype, {
+            "install_dir": install_dir,
+            "symlink": symlink_path,
+            "desktop_entry": desktop_path,
+            "icon": icon_path
+        })
 
     else:
         raise RuntimeError(
@@ -463,6 +541,249 @@ def install_file(path: str, app_name_override: str | None, log,
 
 # ─────────────────────────── GTK4 UI ─────────────────────────────────────────
 
+def read_receipts() -> list[dict]:
+    """Read all receipt files from ~/.local/share/fedora-installer/receipts/"""
+    receipts_dir = os.path.expanduser("~/.local/share/fedora-installer/receipts")
+    if not os.path.isdir(receipts_dir):
+        return []
+    receipts = []
+    for f in os.listdir(receipts_dir):
+        if f.endswith(".json"):
+            try:
+                with open(os.path.join(receipts_dir, f)) as file:
+                    data = json.load(file)
+                    data["receipt_file"] = os.path.join(receipts_dir, f)
+                    receipts.append(data)
+            except Exception:
+                pass
+    return sorted(receipts, key=lambda x: x.get("installed_at", ""), reverse=True)
+
+
+def uninstall_app(app_name: str, install_type: str, paths: dict, package_name: str | None, log, sudo_password: str | None = None, cancel_token: CancelToken | None = None):
+    """
+    Uninstalls an application based on its type and paths.
+    """
+    log(f"Starting uninstallation of {app_name} ({install_type})")
+    
+    def sudo_run(cmd: list[str]):
+        if cancel_token:
+            cancel_token.check()
+        if sudo_password:
+            full_cmd = ["sudo", "-S"] + cmd
+            proc = subprocess.Popen(
+                full_cmd, stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            if cancel_token:
+                cancel_token.register(proc)
+            try:
+                stdout, stderr = proc.communicate(input=(sudo_password + "\n").encode())
+            finally:
+                if cancel_token:
+                    cancel_token.unregister()
+            return subprocess.CompletedProcess(full_cmd, proc.returncode, stdout, stderr)
+        else:
+            return cancellable_run(["sudo"] + cmd, token=cancel_token)
+
+    # 1. Package Manager Uninstalls (RPM / DEB / Flatpak)
+    if install_type in ("rpm", "deb"):
+        if not package_name:
+            package_name = app_name
+        log(f"Removing package {package_name} via dnf…")
+        proc = sudo_run(["dnf", "remove", "-y", package_name])
+        _log_output(proc.stdout.decode(errors="replace"), log)
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr.decode(errors="replace"))
+        log(f"✅ {app_name} package removed.")
+
+    elif install_type == "flatpak":
+        if not package_name:
+            raise RuntimeError("Flatpak application ID not found.")
+        log(f"Uninstalling Flatpak {package_name}…")
+        proc = cancellable_run(["flatpak", "uninstall", "--user", "-y", package_name], token=cancel_token)
+        _log_output(proc.stdout.decode(errors="replace"), log)
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr.decode(errors="replace"))
+        log(f"✅ {app_name} Flatpak uninstalled.")
+
+    # 2. File-based Uninstalls (AppImage / Tarball / ZIP)
+    else:
+        # Remove desktop entry
+        desktop_path = paths.get("desktop_entry")
+        if desktop_path and os.path.exists(desktop_path):
+            try:
+                os.remove(desktop_path)
+                log(f"Removed desktop entry: {desktop_path}")
+            except Exception as e:
+                log(f"⚠️  Could not remove desktop entry: {e}")
+        elif not desktop_path:
+            guess_desktop = os.path.expanduser(f"~/.local/share/applications/{app_name.lower().replace(' ', '-')}.desktop")
+            if os.path.exists(guess_desktop):
+                try:
+                    os.remove(guess_desktop)
+                    log(f"Removed guessed desktop entry: {guess_desktop}")
+                except Exception as e:
+                    log(f"⚠️  Could not remove desktop entry: {e}")
+
+        # Remove icon
+        icon_path = paths.get("icon")
+        if icon_path and os.path.exists(icon_path):
+            try:
+                os.remove(icon_path)
+                log(f"Removed icon: {icon_path}")
+            except Exception as e:
+                log(f"⚠️  Could not remove icon: {e}")
+
+        # Remove install_dir or binary
+        install_dir = paths.get("install_dir")
+        if install_dir and os.path.exists(install_dir):
+            if os.path.isdir(install_dir):
+                log(f"Removing directory {install_dir}…")
+                if install_dir.startswith("/opt"):
+                    proc = sudo_run(["rm", "-rf", install_dir])
+                    if proc.returncode != 0:
+                        raise RuntimeError(f"Could not remove {install_dir}: {proc.stderr.decode()}")
+                else:
+                    shutil.rmtree(install_dir)
+                log(f"Removed directory: {install_dir}")
+            else:
+                log(f"Removing binary {install_dir}…")
+                try:
+                    os.remove(install_dir)
+                    log(f"Removed binary: {install_dir}")
+                except Exception as e:
+                    log(f"⚠️  Could not remove binary: {e}")
+        
+        # Remove symlink
+        symlink = paths.get("symlink")
+        if symlink and os.path.exists(symlink):
+            log(f"Removing symlink {symlink}…")
+            if symlink.startswith(("/usr/local/bin", "/usr/bin")):
+                proc = sudo_run(["rm", "-f", symlink])
+                if proc.returncode != 0:
+                    raise RuntimeError(f"Could not remove symlink: {proc.stderr.decode()}")
+            else:
+                try:
+                    os.remove(symlink)
+                except Exception as e:
+                    log(f"⚠️  Could not remove symlink: {e}")
+            log(f"Removed symlink: {symlink}")
+
+    # Update desktop database
+    subprocess.run(
+        ["update-desktop-database", os.path.expanduser("~/.local/share/applications")],
+        capture_output=True,
+    )
+    log("Desktop database updated.")
+
+
+class UninstallDialog(Adw.MessageDialog):
+    def __init__(self, parent, app_name, install_type, paths, package_name, receipt_file=None, sudo_password=None):
+        super().__init__(transient_for=parent, heading=f"Uninstalling {app_name}")
+        
+        self.app_name = app_name
+        self.install_type = install_type
+        self.paths = paths
+        self.package_name = package_name
+        self.receipt_file = receipt_file
+        self.sudo_password = sudo_password
+        self.cancel_token = CancelToken()
+        self.uninstalling = True
+        
+        # Setup UI
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        box.set_margin_top(12)
+        
+        self.progress = Gtk.ProgressBar()
+        self.progress.set_pulse_step(0.05)
+        box.append(self.progress)
+        
+        log_scroll = Gtk.ScrolledWindow()
+        log_scroll.set_size_request(450, 200)
+        log_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        self.log_view = Gtk.TextView()
+        self.log_view.set_editable(False)
+        self.log_view.set_monospace(True)
+        self.log_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.log_buffer = self.log_view.get_buffer()
+        log_scroll.set_child(self.log_view)
+        box.append(log_scroll)
+        
+        self.set_extra_child(box)
+        
+        # Responses
+        self.add_response("cancel", "Cancel")
+        self.set_response_appearance("cancel", Adw.ResponseAppearance.DESTRUCTIVE)
+        self.add_response("close", "Close")
+        self.set_response_enabled("close", False)
+        
+        self.connect("response", self._on_response)
+        
+        # Start pulse timer
+        self.pulse_id = GLib.timeout_add(100, self._pulse)
+        
+        # Start thread
+        threading.Thread(target=self._run_uninstall, daemon=True).start()
+
+    def _log(self, text: str):
+        def _append():
+            end = self.log_buffer.get_end_iter()
+            self.log_buffer.insert(end, text.strip() + "\n")
+            adj = self.log_view.get_parent().get_vadjustment()
+            adj.set_value(adj.get_upper() - adj.get_page_size())
+        GLib.idle_add(_append)
+
+    def _pulse(self):
+        if self.uninstalling:
+            self.progress.pulse()
+            return True
+        return False
+
+    def _run_uninstall(self):
+        try:
+            uninstall_app(
+                self.app_name, self.install_type, self.paths, self.package_name,
+                self._log, sudo_password=self.sudo_password, cancel_token=self.cancel_token
+            )
+            # Delete receipt file if present and uninstallation was successful
+            if self.receipt_file and os.path.exists(self.receipt_file):
+                try:
+                    os.remove(self.receipt_file)
+                    self._log(f"Receipt deleted: {self.receipt_file}")
+                except Exception as e:
+                    self._log(f"⚠️  Could not delete receipt file: {e}")
+            
+            GLib.idle_add(self._done, True, None)
+        except CancelledError:
+            GLib.idle_add(self._done, False, "Cancelled by user.")
+        except Exception as e:
+            GLib.idle_add(self._done, False, str(e))
+
+    def _done(self, success, error):
+        self.uninstalling = False
+        self.progress.set_visible(False)
+        self.set_response_enabled("close", True)
+        self.set_response_enabled("cancel", False)
+        
+        if success:
+            self._log("\n✅ Uninstallation complete!")
+            self.set_body("Application has been successfully uninstalled.")
+        else:
+            self._log(f"\n❌ Error: {error}")
+            self.set_body(f"Uninstallation failed: {error}")
+            
+        parent = self.get_transient_for()
+        if parent and hasattr(parent, "refresh_installed_tab"):
+            GLib.idle_add(parent.refresh_installed_tab)
+
+    def _on_response(self, dialog, response_id):
+        if response_id == "cancel":
+            self._log("Cancelling...")
+            self.cancel_token.cancel()
+        else:
+            self.destroy()
+
+
 class InstallerWindow(Adw.ApplicationWindow):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -473,6 +794,10 @@ class InstallerWindow(Adw.ApplicationWindow):
         self._file_path: str | None = None
         self._installing = False
         self._cancel_token: CancelToken | None = None
+        
+        self._search_lock = threading.Lock()
+        self._search_thread = None
+        self._search_cancelled = False
 
         # ── root box ──────────────────────────────────────────────────────────
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
@@ -493,7 +818,26 @@ class InstallerWindow(Adw.ApplicationWindow):
         # ── content ───────────────────────────────────────────────────────────
         scroll = Gtk.ScrolledWindow(vexpand=True)
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        root.append(scroll)
+
+        # ── TabView and TabBar ───────────────────────────────────────────────
+        self.tab_view = Adw.TabView()
+        self.tab_bar = Adw.TabBar()
+        self.tab_bar.set_view(self.tab_view)
+        
+        root.append(self.tab_bar)
+        root.append(self.tab_view)
+
+        page_install = self.tab_view.append(scroll)
+        page_install.set_title("Install")
+        page_install.set_closable(False)
+
+        installed_scroll = Gtk.ScrolledWindow(vexpand=True)
+        installed_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self._build_installed_tab(installed_scroll)
+        
+        page_installed = self.tab_view.append(installed_scroll)
+        page_installed.set_title("Installed")
+        page_installed.set_closable(False)
 
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
         content.set_margin_top(32)
@@ -614,6 +958,20 @@ class InstallerWindow(Adw.ApplicationWindow):
     border-color: @accent_color;
     background: alpha(@accent_color, 0.10);
 }
+.badge {
+    font-weight: bold;
+    font-size: 0.75rem;
+    padding: 2px 8px;
+    border-radius: 9999px;
+    color: white;
+}
+.badge-rpm { background-color: #34495e; }
+.badge-deb { background-color: #c0392b; }
+.badge-flatpak { background-color: #2980b9; }
+.badge-appimage { background-color: #27ae60; }
+.badge-tarball { background-color: #d35400; }
+.badge-zip { background-color: #8e44ad; }
+.badge-unknown { background-color: #7f8c8d; }
 """)
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
@@ -810,6 +1168,7 @@ class InstallerWindow(Adw.ApplicationWindow):
 
         if success:
             self._log("Installation complete!")
+            GLib.idle_add(self.refresh_installed_tab)
             dialog = Adw.MessageDialog(
                 transient_for=self,
                 heading="Installed!",
@@ -844,6 +1203,437 @@ class InstallerWindow(Adw.ApplicationWindow):
         dialog.add_response("ok", "OK")
         dialog.present()
         return False
+
+    def _build_installed_tab(self, scroll):
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
+        content.set_margin_top(24)
+        content.set_margin_bottom(24)
+        content.set_margin_start(32)
+        content.set_margin_end(32)
+        scroll.set_child(content)
+
+        # ── Section A: Installed by Fedora Installer ──────────────────────────
+        self.receipts_group = Adw.PreferencesGroup(title="Installed by Fedora Installer")
+        
+        self.receipts_list = Gtk.ListBox()
+        self.receipts_list.add_css_class("boxed-list")
+        self.receipts_group.add(self.receipts_list)
+        
+        self.empty_status = Adw.StatusPage()
+        self.empty_status.set_title("No applications installed yet")
+        self.empty_status.set_description("Applications you install via Fedora Installer will appear here.")
+        self.empty_status.set_icon_name("system-software-install-symbolic")
+        self.empty_status.set_margin_top(16)
+        self.empty_status.set_margin_bottom(16)
+        
+        content.append(self.receipts_group)
+        content.append(self.empty_status)
+
+        # ── Section B: Search All Installed Apps ──────────────────────────────
+        search_section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        content.append(search_section)
+        
+        search_title = Gtk.Label(label="Search All Installed Apps")
+        search_title.add_css_class("title-2")
+        search_title.set_halign(Gtk.Align.START)
+        search_section.append(search_title)
+        
+        self.search_entry = Gtk.SearchEntry()
+        self.search_entry.set_placeholder_text("Search live across DNF, Flatpak, AppImages, /opt...")
+        self.search_entry.connect("search-changed", self._on_search_changed)
+        search_section.append(self.search_entry)
+        
+        self.search_warning_label = Gtk.Label(label="* Not installed via Fedora Installer — removal is best-effort for AppImage/Manual, clean for DNF/Flatpak.")
+        self.search_warning_label.add_css_class("dim-label")
+        self.search_warning_label.add_css_class("caption")
+        self.search_warning_label.set_halign(Gtk.Align.START)
+        self.search_warning_label.set_wrap(True)
+        search_section.append(self.search_warning_label)
+        
+        # Results Groups
+        self.search_flatpak_list = Gtk.ListBox()
+        self.search_flatpak_list.add_css_class("boxed-list")
+        self.search_flatpak_group = Adw.PreferencesGroup(title="Flatpak Applications")
+        self.search_flatpak_group.add(self.search_flatpak_list)
+        self.search_flatpak_group.set_visible(False)
+        content.append(self.search_flatpak_group)
+
+        self.search_appimage_list = Gtk.ListBox()
+        self.search_appimage_list.add_css_class("boxed-list")
+        self.search_appimage_group = Adw.PreferencesGroup(title="AppImages (in ~/.local/bin)")
+        self.search_appimage_group.add(self.search_appimage_list)
+        self.search_appimage_group.set_visible(False)
+        content.append(self.search_appimage_group)
+
+        self.search_manual_list = Gtk.ListBox()
+        self.search_manual_list.add_css_class("boxed-list")
+        self.search_manual_group = Adw.PreferencesGroup(title="Manual (/opt directories)")
+        self.search_manual_group.add(self.search_manual_list)
+        self.search_manual_group.set_visible(False)
+        content.append(self.search_manual_group)
+
+        self.search_dnf_list = Gtk.ListBox()
+        self.search_dnf_list.add_css_class("boxed-list")
+        self.search_dnf_group = Adw.PreferencesGroup(title="DNF Packages")
+        self.search_dnf_group.add(self.search_dnf_list)
+        self.search_dnf_group.set_visible(False)
+        content.append(self.search_dnf_group)
+
+        self.refresh_installed_tab()
+
+    def refresh_installed_tab(self):
+        while (child := self.receipts_list.get_first_child()):
+            self.receipts_list.remove(child)
+            
+        receipts = read_receipts()
+        if receipts:
+            self.receipts_group.set_visible(True)
+            self.empty_status.set_visible(False)
+            
+            for r in receipts:
+                row = Adw.ActionRow()
+                row.set_title(r.get("app_name", "Unknown App"))
+                
+                installed_at = r.get("installed_at", "")
+                try:
+                    date_str = installed_at.split("T")[0]
+                except Exception:
+                    date_str = installed_at
+                    
+                paths = r.get("paths", {})
+                path_val = paths.get("install_dir") or paths.get("desktop_entry") or r.get("package_name") or ""
+                row.set_subtitle(f"Installed: {date_str}  ·  {path_val}")
+                
+                itype = r.get("install_type", "unknown")
+                badge = Gtk.Label(label=itype.upper())
+                badge.add_css_class("badge")
+                badge.add_css_class(f"badge-{itype.lower()}")
+                badge.set_valign(Gtk.Align.CENTER)
+                row.add_prefix(badge)
+                
+                remove_btn = Gtk.Button()
+                remove_btn.set_icon_name("user-trash-symbolic")
+                remove_btn.add_css_class("flat")
+                remove_btn.add_css_class("destructive-action")
+                remove_btn.set_valign(Gtk.Align.CENTER)
+                remove_btn.connect("clicked", self._on_remove_receipt_clicked, r)
+                row.add_suffix(remove_btn)
+                
+                self.receipts_list.append(row)
+        else:
+            self.receipts_group.set_visible(False)
+            self.empty_status.set_visible(True)
+
+    def _on_search_changed(self, entry):
+        query = entry.get_text().strip()
+        if not query:
+            self._clear_search_results()
+            return
+        
+        with self._search_lock:
+            self._search_cancelled = True
+            
+        threading.Thread(target=self._run_search, args=(query,), daemon=True).start()
+
+    def _run_search(self, query):
+        with self._search_lock:
+            self._search_cancelled = False
+            
+        results = {"DNF": [], "Flatpak": [], "AppImage": [], "Manual": []}
+        
+        # 1. Search AppImages
+        if self._search_cancelled: return
+        bin_dir = os.path.expanduser("~/.local/bin")
+        if os.path.isdir(bin_dir):
+            try:
+                for f in os.listdir(bin_dir):
+                    if self._search_cancelled: return
+                    if f.lower().endswith(".appimage") and query.lower() in f.lower():
+                        results["AppImage"].append({
+                            "name": f.replace(".AppImage", "").replace(".appimage", ""),
+                            "path": os.path.join(bin_dir, f)
+                        })
+            except Exception:
+                pass
+
+        # 2. Search Manual (/opt)
+        if self._search_cancelled: return
+        opt_dir = "/opt"
+        if os.path.isdir(opt_dir):
+            try:
+                for d in os.listdir(opt_dir):
+                    if self._search_cancelled: return
+                    full_path = os.path.join(opt_dir, d)
+                    if os.path.isdir(full_path) and query.lower() in d.lower():
+                        results["Manual"].append({
+                            "name": d,
+                            "path": full_path
+                        })
+            except Exception:
+                pass
+
+        # 3. Search Flatpak
+        if self._search_cancelled: return
+        try:
+            p_user = subprocess.run(["flatpak", "list", "--app", "--user", "--json"], capture_output=True, text=True)
+            if not self._search_cancelled and p_user.returncode == 0 and p_user.stdout:
+                for item in json.loads(p_user.stdout):
+                    if self._search_cancelled: return
+                    name = item.get("name", "")
+                    app_id = item.get("application_id", "")
+                    if query.lower() in name.lower() or query.lower() in app_id.lower():
+                        results["Flatpak"].append({
+                            "name": name,
+                            "package_name": app_id,
+                            "install_type": "flatpak"
+                        })
+            p_sys = subprocess.run(["flatpak", "list", "--app", "--system", "--json"], capture_output=True, text=True)
+            if not self._search_cancelled and p_sys.returncode == 0 and p_sys.stdout:
+                for item in json.loads(p_sys.stdout):
+                    if self._search_cancelled: return
+                    name = item.get("name", "")
+                    app_id = item.get("application_id", "")
+                    if query.lower() in name.lower() or query.lower() in app_id.lower():
+                        if not any(x["package_name"] == app_id for x in results["Flatpak"]):
+                            results["Flatpak"].append({
+                                "name": name,
+                                "package_name": app_id,
+                                "install_type": "flatpak"
+                            })
+        except Exception:
+            pass
+
+        # 4. Search DNF (using rpm -qa)
+        if self._search_cancelled: return
+        try:
+            p_rpm = subprocess.run(["rpm", "-qa", "--qf", "%{NAME}|%{SUMMARY}\n"], capture_output=True, text=True, errors="replace")
+            if not self._search_cancelled and p_rpm.returncode == 0:
+                for line in p_rpm.stdout.splitlines():
+                    if self._search_cancelled: return
+                    if "|" in line:
+                        name, summary = line.split("|", 1)
+                        if query.lower() in name.lower() or query.lower() in summary.lower():
+                            results["DNF"].append({
+                                "name": name,
+                                "summary": summary,
+                                "package_name": name,
+                                "install_type": "rpm"
+                            })
+        except Exception:
+            pass
+
+        if not self._search_cancelled:
+            GLib.idle_add(self._update_search_results_ui, results)
+
+    def _clear_search_results(self):
+        for lst in (self.search_flatpak_list, self.search_appimage_list, self.search_manual_list, self.search_dnf_list):
+            while (child := lst.get_first_child()):
+                lst.remove(child)
+        self.search_flatpak_group.set_visible(False)
+        self.search_appimage_group.set_visible(False)
+        self.search_manual_group.set_visible(False)
+        self.search_dnf_group.set_visible(False)
+
+    def _update_search_results_ui(self, results):
+        self._clear_search_results()
+        
+        flatpaks = results.get("Flatpak", [])
+        if flatpaks:
+            self.search_flatpak_group.set_visible(True)
+            for item in flatpaks:
+                row = Adw.ActionRow()
+                row.set_title(item["name"])
+                row.set_subtitle(item["package_name"])
+                
+                btn = Gtk.Button()
+                btn.set_icon_name("user-trash-symbolic")
+                btn.add_css_class("flat")
+                btn.add_css_class("destructive-action")
+                btn.set_valign(Gtk.Align.CENTER)
+                btn.connect("clicked", self._on_remove_search_clicked, "flatpak", item["name"], item["package_name"])
+                row.add_suffix(btn)
+                
+                self.search_flatpak_list.append(row)
+                
+        appimages = results.get("AppImage", [])
+        if appimages:
+            self.search_appimage_group.set_visible(True)
+            for item in appimages:
+                row = Adw.ActionRow()
+                row.set_title(item["name"])
+                row.set_subtitle(item["path"])
+                
+                btn = Gtk.Button()
+                btn.set_icon_name("user-trash-symbolic")
+                btn.add_css_class("flat")
+                btn.add_css_class("destructive-action")
+                btn.set_valign(Gtk.Align.CENTER)
+                btn.connect("clicked", self._on_remove_search_clicked, "appimage", item["name"], item["path"])
+                row.add_suffix(btn)
+                
+                self.search_appimage_list.append(row)
+
+        manual = results.get("Manual", [])
+        if manual:
+            self.search_manual_group.set_visible(True)
+            for item in manual:
+                row = Adw.ActionRow()
+                row.set_title(item["name"])
+                row.set_subtitle(item["path"])
+                
+                btn = Gtk.Button()
+                btn.set_icon_name("user-trash-symbolic")
+                btn.add_css_class("flat")
+                btn.add_css_class("destructive-action")
+                btn.set_valign(Gtk.Align.CENTER)
+                btn.connect("clicked", self._on_remove_search_clicked, "manual", item["name"], item["path"])
+                row.add_suffix(btn)
+                
+                self.search_manual_list.append(row)
+
+        dnf = results.get("DNF", [])
+        if dnf:
+            self.search_dnf_group.set_visible(True)
+            for item in dnf[:50]:
+                row = Adw.ActionRow()
+                row.set_title(item["name"])
+                row.set_subtitle(item.get("summary", ""))
+                
+                btn = Gtk.Button()
+                btn.set_icon_name("user-trash-symbolic")
+                btn.add_css_class("flat")
+                btn.add_css_class("destructive-action")
+                btn.set_valign(Gtk.Align.CENTER)
+                btn.connect("clicked", self._on_remove_search_clicked, "dnf", item["name"], item["package_name"])
+                row.add_suffix(btn)
+                
+                self.search_dnf_list.append(row)
+
+    def _on_remove_receipt_clicked(self, btn, receipt):
+        app_name = receipt.get("app_name")
+        install_type = receipt.get("install_type")
+        paths = receipt.get("paths", {})
+        package_name = receipt.get("package_name")
+        receipt_file = receipt.get("receipt_file")
+        
+        dialog = Adw.MessageDialog(
+            transient_for=self,
+            heading="Uninstall Application?",
+            body=f"Are you sure you want to uninstall {app_name}?"
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("uninstall", "Uninstall")
+        dialog.set_response_appearance("uninstall", Adw.ResponseAppearance.DESTRUCTIVE)
+        
+        def on_confirm_response(dialog, response_id):
+            if response_id == "uninstall":
+                needs_sudo = (install_type in ("rpm", "deb")) or (paths.get("install_dir") and paths.get("install_dir").startswith("/opt")) or (paths.get("symlink") and paths.get("symlink").startswith(("/usr/local/bin", "/usr/bin")))
+                
+                if needs_sudo:
+                    self._prompt_sudo_password(
+                        f"Uninstalling {app_name} requires administrator privileges.",
+                        lambda pwd: self._start_uninstall(app_name, install_type, paths, package_name, receipt_file, pwd)
+                    )
+                else:
+                    self._start_uninstall(app_name, install_type, paths, package_name, receipt_file, None)
+                    
+        dialog.connect("response", on_confirm_response)
+        dialog.present()
+
+    def _on_remove_search_clicked(self, btn, item_type, name, path_or_pkg):
+        if item_type == 'manual':
+            dialog = Adw.MessageDialog(
+                transient_for=self,
+                heading="Destructive Action Warning",
+                body=f"Warning: This will delete the entire directory {path_or_pkg} and all of its contents. This action cannot be undone.\n\nAre you sure you want to proceed?"
+            )
+            dialog.add_response("cancel", "Cancel")
+            dialog.add_response("proceed", "Delete Permanently")
+            dialog.set_response_appearance("proceed", Adw.ResponseAppearance.DESTRUCTIVE)
+            confirm_response_id = "proceed"
+        else:
+            dialog = Adw.MessageDialog(
+                transient_for=self,
+                heading="Uninstall Application?",
+                body=f"Are you sure you want to uninstall {name}?"
+            )
+            dialog.add_response("cancel", "Cancel")
+            dialog.add_response("uninstall", "Uninstall")
+            dialog.set_response_appearance("uninstall", Adw.ResponseAppearance.DESTRUCTIVE)
+            confirm_response_id = "uninstall"
+            
+        def on_confirm_response(dialog, response_id):
+            if response_id == confirm_response_id:
+                paths = {}
+                package_name = None
+                install_type = None
+                
+                if item_type == 'dnf':
+                    install_type = "rpm"
+                    package_name = path_or_pkg
+                elif item_type == 'flatpak':
+                    install_type = "flatpak"
+                    package_name = path_or_pkg
+                elif item_type == 'appimage':
+                    install_type = "appimage"
+                    paths = {
+                        "install_dir": path_or_pkg,
+                        "desktop_entry": os.path.expanduser(f"~/.local/share/applications/{name.lower().replace(' ', '-')}.desktop")
+                    }
+                elif item_type == 'manual':
+                    install_type = "tarball"
+                    paths = {
+                        "install_dir": path_or_pkg,
+                        "symlink": f"/usr/local/bin/{name}",
+                        "desktop_entry": os.path.expanduser(f"~/.local/share/applications/{name.lower().replace(' ', '-')}.desktop")
+                    }
+                
+                needs_sudo = (item_type in ('dnf', 'manual'))
+                
+                if needs_sudo:
+                    self._prompt_sudo_password(
+                        f"Uninstalling {name} requires administrator privileges.",
+                        lambda pwd: self._start_uninstall(name, install_type, paths, package_name, None, pwd)
+                    )
+                else:
+                    self._start_uninstall(name, install_type, paths, package_name, None, None)
+                    
+        dialog.connect("response", on_confirm_response)
+        dialog.present()
+
+    def _prompt_sudo_password(self, message, callback):
+        dialog = Adw.MessageDialog(
+            transient_for=self,
+            heading="Authentication Required",
+            body=message
+        )
+        
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.set_margin_top(8)
+        
+        pwd_entry = Gtk.PasswordEntry()
+        pwd_entry.set_placeholder_text("Password")
+        pwd_entry.set_activates_default(True)
+        box.append(pwd_entry)
+        
+        dialog.set_extra_child(box)
+        
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("authenticate", "Authenticate")
+        dialog.set_default_response("authenticate")
+        dialog.set_response_appearance("authenticate", Adw.ResponseAppearance.SUGGESTED)
+        
+        def on_response(dlg, response_id):
+            if response_id == "authenticate":
+                password = pwd_entry.get_text().strip()
+                callback(password)
+                
+        dialog.connect("response", on_response)
+        dialog.present()
+
+    def _start_uninstall(self, app_name, install_type, paths, package_name, receipt_file, sudo_password):
+        dlg = UninstallDialog(self, app_name, install_type, paths, package_name, receipt_file, sudo_password)
+        dlg.present()
 
 
 class FedoraInstallerApp(Adw.Application):
