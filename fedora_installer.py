@@ -391,7 +391,7 @@ def install_file(path: str, app_name_override: str | None, log,
                     proc.wait()
                     return subprocess.CompletedProcess(full_cmd, proc.returncode, b"", stderr_str.encode(errors="replace"))
                 else:
-                    stdout, stderr = proc.stdout.read(), proc.stderr.read()
+                    stdout, stderr = proc.stdout.read(64 * 1024), proc.stderr.read(64 * 1024)
                     proc.wait()
                     return subprocess.CompletedProcess(full_cmd, proc.returncode, stdout, stderr)
             finally:
@@ -730,7 +730,7 @@ def uninstall_app(app_name: str, install_type: str, paths: dict, package_name: s
                     proc.wait()
                     return subprocess.CompletedProcess(full_cmd, proc.returncode, b"", stderr_str.encode(errors="replace"))
                 else:
-                    stdout, stderr = proc.stdout.read(), proc.stderr.read()
+                    stdout, stderr = proc.stdout.read(64 * 1024), proc.stderr.read(64 * 1024)
                     proc.wait()
                     return subprocess.CompletedProcess(full_cmd, proc.returncode, stdout, stderr)
             finally:
@@ -1758,10 +1758,13 @@ class InstallerWindow(Adw.ApplicationWindow):
                 for f in os.listdir(bin_dir):
                     if cancelled.is_set(): return
                     if f.lower().endswith(".appimage") and query.lower() in f.lower():
-                        results["AppImage"].append({
-                            "name": f.replace(".AppImage", "").replace(".appimage", ""),
-                            "path": os.path.join(bin_dir, f)
-                        })
+                        if len(results["AppImage"]) < 50:
+                            results["AppImage"].append({
+                                "name": f.replace(".AppImage", "").replace(".appimage", ""),
+                                "path": os.path.join(bin_dir, f)
+                            })
+                        else:
+                            break
             except Exception:
                 pass
 
@@ -1774,36 +1777,52 @@ class InstallerWindow(Adw.ApplicationWindow):
                     if cancelled.is_set(): return
                     full_path = os.path.join(opt_dir, d)
                     if os.path.isdir(full_path) and query.lower() in d.lower():
-                        results["Manual"].append({
-                            "name": d,
-                            "path": full_path
-                        })
+                        if len(results["Manual"]) < 50:
+                            results["Manual"].append({
+                                "name": d,
+                                "path": full_path
+                            })
+                        else:
+                            break
             except Exception:
                 pass
 
         # 3. Search Flatpak
         if cancelled.is_set(): return
         try:
-            p_user = subprocess.run(["flatpak", "list", "--app", "--user", "--json"], capture_output=True, text=True)
-            if not cancelled.is_set() and p_user.returncode == 0 and p_user.stdout:
-                for item in json.loads(p_user.stdout):
-                    if cancelled.is_set(): return
-                    name = item.get("name", "")
-                    app_id = item.get("application_id", "")
-                    if query.lower() in name.lower() or query.lower() in app_id.lower():
+            p_user = subprocess.Popen(["flatpak", "list", "--app", "--user", "--json"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            try:
+                user_items = json.load(p_user.stdout)
+            except Exception:
+                user_items = []
+            p_user.wait()
+            
+            for item in user_items:
+                if cancelled.is_set(): return
+                name = item.get("name", "")
+                app_id = item.get("application_id", "")
+                if query.lower() in name.lower() or query.lower() in app_id.lower():
+                    if len(results["Flatpak"]) < 50:
                         results["Flatpak"].append({
                             "name": name,
                             "package_name": app_id,
                             "install_type": "flatpak"
                         })
-            p_sys = subprocess.run(["flatpak", "list", "--app", "--system", "--json"], capture_output=True, text=True)
-            if not cancelled.is_set() and p_sys.returncode == 0 and p_sys.stdout:
-                for item in json.loads(p_sys.stdout):
-                    if cancelled.is_set(): return
-                    name = item.get("name", "")
-                    app_id = item.get("application_id", "")
-                    if query.lower() in name.lower() or query.lower() in app_id.lower():
-                        if not any(x["package_name"] == app_id for x in results["Flatpak"]):
+            
+            p_sys = subprocess.Popen(["flatpak", "list", "--app", "--system", "--json"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            try:
+                sys_items = json.load(p_sys.stdout)
+            except Exception:
+                sys_items = []
+            p_sys.wait()
+            
+            for item in sys_items:
+                if cancelled.is_set(): return
+                name = item.get("name", "")
+                app_id = item.get("application_id", "")
+                if query.lower() in name.lower() or query.lower() in app_id.lower():
+                    if not any(x["package_name"] == app_id for x in results["Flatpak"]):
+                        if len(results["Flatpak"]) < 50:
                             results["Flatpak"].append({
                                 "name": name,
                                 "package_name": app_id,
@@ -1830,12 +1849,16 @@ class InstallerWindow(Adw.ApplicationWindow):
                     if "|" in line:
                         name, summary = line.split("|", 1)
                         if query.lower() in name.lower() or query.lower() in summary.lower():
-                            results["DNF"].append({
-                                "name": name,
-                                "summary": summary,
-                                "package_name": name,
-                                "install_type": "rpm"
-                            })
+                            if len(results["DNF"]) < 50:
+                                results["DNF"].append({
+                                    "name": name,
+                                    "summary": summary,
+                                    "package_name": name,
+                                    "install_type": "rpm"
+                                })
+                            else:
+                                proc.terminate()
+                                break
             finally:
                 timer.cancel()
                 if proc.poll() is None:
@@ -1864,7 +1887,7 @@ class InstallerWindow(Adw.ApplicationWindow):
         flatpaks = results.get("Flatpak", [])
         if flatpaks:
             self.search_flatpak_group.set_visible(True)
-            for item in flatpaks:
+            for item in flatpaks[:50]:
                 row = Adw.ActionRow()
                 row.set_title(item["name"])
                 row.set_subtitle(item["package_name"])
@@ -1882,7 +1905,7 @@ class InstallerWindow(Adw.ApplicationWindow):
         appimages = results.get("AppImage", [])
         if appimages:
             self.search_appimage_group.set_visible(True)
-            for item in appimages:
+            for item in appimages[:50]:
                 row = Adw.ActionRow()
                 row.set_title(item["name"])
                 row.set_subtitle(item["path"])
@@ -1900,7 +1923,7 @@ class InstallerWindow(Adw.ApplicationWindow):
         manual = results.get("Manual", [])
         if manual:
             self.search_manual_group.set_visible(True)
-            for item in manual:
+            for item in manual[:50]:
                 row = Adw.ActionRow()
                 row.set_title(item["name"])
                 row.set_subtitle(item["path"])
