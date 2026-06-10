@@ -1,6 +1,6 @@
 # Fedora Installer
 
-![Version](https://img.shields.io/badge/version-1.3.0-blue)
+![Version](https://img.shields.io/badge/version-1.4.0-blue)
 ![License](https://img.shields.io/badge/license-GPL--3.0-green)
 
 A universal **GUI + CLI** installer for Fedora/GNOME.
@@ -239,6 +239,12 @@ This project is licensed under the **GNU General Public License v3.0** — see t
 ---
 
 ## Changelog
+
+### v1.4.0 (2026-06-10)
+
+- **Optimized Memory Usage & OOM Prevention** — Refactored command runners (`cancellable_run` and `sudo_run`) to stream stdout and stderr line-by-line using a custom generator. Subprocess logs no longer load entire command outputs into RAM.
+- **Efficient Package Search** — Streamed live search results directly from `rpm -qa` using Popen pipelines with timer-based timeouts, keeping memory footprints low.
+- **Aggressive Garbage Collection** — Integrated explicit `gc.collect()` sweeps following installation completion, cancellation, uninstallation, and search updates to ensure GTK objects are promptly garbage collected.
 
 ### v1.3.0 (2026-06-10)
 

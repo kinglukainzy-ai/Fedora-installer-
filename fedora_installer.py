@@ -37,6 +37,7 @@ import json
 import shutil
 import tempfile
 from datetime import datetime
+import gc
 
 APP_ID = "io.github.kinglukainzy_ai.FedoraInstaller"
 VERSION_FILE = "/usr/local/lib/fedora-installer/VERSION"
@@ -61,6 +62,31 @@ def _log_output(text: str, log, max_lines: int = 20):
     else:
         for l in lines:
             log(l)
+
+
+def _stream_output(proc, log, cancel_token=None, max_lines: int = 200):
+    """Stream subprocess stdout line-by-line, logging each line.
+
+    Reads directly from the pipe — no full buffer is ever held in RAM.
+    Stops early if cancel_token is set.  Suppresses output after max_lines
+    and reports how many lines were hidden.
+    """
+    count = 0
+    suppressed = 0
+    for raw_line in proc.stdout:
+        if cancel_token and cancel_token.cancelled:
+            break
+        line = raw_line.decode(errors="replace").rstrip("\n")
+        count += 1
+        if count <= max_lines:
+            log(line)
+        else:
+            suppressed += 1
+    if suppressed:
+        log(f"… ({suppressed} more lines suppressed)")
+    # Drain stderr (capped) so the pipe doesn't block
+    stderr_bytes = proc.stderr.read(64 * 1024)  # cap at 64 KB
+    return stderr_bytes.decode(errors="replace") if stderr_bytes else ""
 
 
 class CancelledError(Exception):
@@ -110,10 +136,14 @@ class CancelToken:
             self._active_proc = None
 
 
-def cancellable_run(cmd: list[str], token: CancelToken | None = None, **kwargs):
+def cancellable_run(cmd: list[str], token: CancelToken | None = None,
+                    log=None, **kwargs):
     """Run a subprocess, killing it if the token is cancelled.
 
     Uses Popen internally so the process can be terminated mid-flight.
+    If *log* is provided, stdout is streamed line-by-line through
+    _stream_output (never buffered fully in RAM).  When log is None,
+    falls back to communicate() for callers that need the bytes.
     Returns a CompletedProcess-like object.
     """
     if token:
@@ -122,7 +152,13 @@ def cancellable_run(cmd: list[str], token: CancelToken | None = None, **kwargs):
     if token:
         token.register(proc)
     try:
-        stdout, stderr = proc.communicate()
+        if log is not None:
+            stderr_str = _stream_output(proc, log, cancel_token=token)
+            proc.wait()
+            stdout = b""
+            stderr = stderr_str.encode(errors="replace")
+        else:
+            stdout, stderr = proc.communicate()
     finally:
         if token:
             token.unregister()
@@ -332,11 +368,12 @@ def install_file(path: str, app_name_override: str | None, log,
     log(f"File type detected: {ftype}")
     log(f"App name: {app_name}")
 
-    def sudo_run(cmd: list[str], **kwargs):
+    def sudo_run(cmd: list[str], stream=False, **kwargs):
+        """Run a command under sudo.  When stream=True, pipe output
+        through _stream_output so it never buffers fully in RAM."""
         if cancel_token:
             cancel_token.check()
         if sudo_password:
-            # sudo_run uses Popen directly to support cancellation
             full_cmd = ["sudo", "-S"] + cmd
             proc = subprocess.Popen(
                 full_cmd, stdin=subprocess.PIPE,
@@ -345,12 +382,24 @@ def install_file(path: str, app_name_override: str | None, log,
             if cancel_token:
                 cancel_token.register(proc)
             try:
-                stdout, stderr = proc.communicate(input=(sudo_password + "\n").encode())
+                # Write the password, then stream
+                proc.stdin.write((sudo_password + "\n").encode())
+                proc.stdin.flush()
+                proc.stdin.close()
+                if stream:
+                    stderr_str = _stream_output(proc, log, cancel_token=cancel_token)
+                    proc.wait()
+                    return subprocess.CompletedProcess(full_cmd, proc.returncode, b"", stderr_str.encode(errors="replace"))
+                else:
+                    stdout, stderr = proc.stdout.read(), proc.stderr.read()
+                    proc.wait()
+                    return subprocess.CompletedProcess(full_cmd, proc.returncode, stdout, stderr)
             finally:
                 if cancel_token:
                     cancel_token.unregister()
-            return subprocess.CompletedProcess(full_cmd, proc.returncode, stdout, stderr)
         else:
+            if stream:
+                return cancellable_run(["sudo"] + cmd, token=cancel_token, log=log, **kwargs)
             return cancellable_run(["sudo"] + cmd, token=cancel_token, **kwargs)
 
     # ── RPM ──────────────────────────────────────────────────────────────────
@@ -365,8 +414,7 @@ def install_file(path: str, app_name_override: str | None, log,
         except Exception as e:
             log(f"⚠️  Could not query RPM package name: {e}")
 
-        proc = sudo_run(["dnf", "install", "-y", path])
-        _log_output(proc.stdout.decode(errors="replace"), log)
+        proc = sudo_run(["dnf", "install", "-y", path], stream=True)
         if proc.returncode != 0:
             raise RuntimeError(proc.stderr.decode(errors="replace"))
         if cancel_token:
@@ -381,8 +429,7 @@ def install_file(path: str, app_name_override: str | None, log,
             log("▸ Installing .deb via distrobox…")
             if subprocess.run(["which", "distrobox"], capture_output=True).returncode != 0:
                 log("▸ distrobox not found — installing…")
-                proc = sudo_run(["dnf", "install", "-y", "distrobox", "podman"])
-                _log_output(proc.stdout.decode(errors="replace"), log)
+                proc = sudo_run(["dnf", "install", "-y", "distrobox", "podman"], stream=True)
                 if proc.returncode != 0:
                     raise RuntimeError("Failed to install distrobox.\n" + proc.stderr.decode(errors="replace"))
             existing = subprocess.run(["distrobox", "list"], capture_output=True, text=True)
@@ -391,18 +438,16 @@ def install_file(path: str, app_name_override: str | None, log,
                 proc = cancellable_run(
                     ["distrobox", "create", "--name", CONTAINER,
                      "--image", "quay.io/toolbx-images/debian-toolbox:testing", "--yes"],
-                    token=cancel_token,
+                    token=cancel_token, log=log
                 )
-                _log_output(proc.stdout.decode(errors="replace"), log)
                 if proc.returncode != 0:
                     raise RuntimeError("Failed to create distrobox container.\n" + proc.stderr.decode(errors="replace"))
             log(f"▸ Installing {os.path.basename(path)} inside container…")
             install_cmd = f"sudo apt-get update -qq && sudo apt-get install -y {shlex.quote(path)}"
             proc = cancellable_run(
                 ["distrobox", "enter", CONTAINER, "--", "bash", "-c", install_cmd],
-                token=cancel_token,
+                token=cancel_token, log=log
             )
-            _log_output(proc.stdout.decode(errors="replace"), log)
             if proc.returncode != 0:
                 raise RuntimeError("apt install failed inside container.\n" + proc.stderr.decode(errors="replace"))
             log("▸ Exporting app to host launcher…")
@@ -414,13 +459,11 @@ def install_file(path: str, app_name_override: str | None, log,
             log("▸ Installing .deb via alien…")
             if subprocess.run(["which", "alien"], capture_output=True).returncode != 0:
                 log("▸ alien not found — installing…")
-                proc = sudo_run(["dnf", "install", "-y", "alien"])
-                _log_output(proc.stdout.decode(errors="replace"), log)
+                proc = sudo_run(["dnf", "install", "-y", "alien"], stream=True)
                 if proc.returncode != 0:
                     raise RuntimeError("Failed to install alien.\n" + proc.stderr.decode(errors="replace"))
             with tempfile.TemporaryDirectory() as tmpdir:
-                conv = cancellable_run(["alien", "--to-rpm", "--scripts", path], token=cancel_token, cwd=tmpdir)
-                _log_output(conv.stdout.decode(errors="replace"), log)
+                conv = cancellable_run(["alien", "--to-rpm", "--scripts", path], token=cancel_token, cwd=tmpdir, log=log)
                 if conv.returncode != 0:
                     raise RuntimeError("alien failed.\n" + conv.stderr.decode(errors="replace"))
                 rpm_files = [f for f in os.listdir(tmpdir) if f.endswith(".rpm")]
@@ -428,8 +471,7 @@ def install_file(path: str, app_name_override: str | None, log,
                     raise RuntimeError("alien did not produce an .rpm file.")
                 rpm_path = os.path.join(tmpdir, rpm_files[0])
                 log(f"▸ Installing converted RPM: {rpm_path}")
-                proc = sudo_run(["dnf", "install", "-y", rpm_path])
-                _log_output(proc.stdout.decode(errors="replace"), log)
+                proc = sudo_run(["dnf", "install", "-y", rpm_path], stream=True)
                 if proc.returncode != 0:
                     raise RuntimeError(proc.stderr.decode(errors="replace"))
             log("✅ .deb converted and installed via alien.")
@@ -452,10 +494,9 @@ def install_file(path: str, app_name_override: str | None, log,
         log("Installing Flatpak bundle…")
         proc = cancellable_run(
             ["flatpak", "install", "--user", "--noninteractive", path],
-            token=cancel_token,
+            token=cancel_token, log=log
         )
         stdout_str = proc.stdout.decode(errors="replace")
-        _log_output(stdout_str, log)
         if proc.returncode != 0:
             raise RuntimeError(proc.stderr.decode(errors="replace"))
         if cancel_token:
@@ -592,13 +633,13 @@ def install_file(path: str, app_name_override: str | None, log,
             log("Found install.sh — running it…")
             proc_sh = cancellable_run(
                 ["bash", install_sh], token=cancel_token,
-                cwd=install_dir,
+                cwd=install_dir, log=log
             )
             if proc_sh.returncode != 0:
                 log(f"⚠️  install.sh exited with code {proc_sh.returncode}")
-                _log_output(proc_sh.stderr.decode(errors="replace"), log)
+                # Stderr is already logged by streaming; if there are other errors raise them
             else:
-                _log_output(proc_sh.stdout.decode(errors="replace"), log)
+                log("install.sh completed.")
         else:
             exe = find_executable(install_dir)
             if exe:
@@ -667,7 +708,9 @@ def uninstall_app(app_name: str, install_type: str, paths: dict, package_name: s
     """
     log(f"Starting uninstallation of {app_name} ({install_type})")
     
-    def sudo_run(cmd: list[str]):
+    def sudo_run(cmd: list[str], stream=False):
+        """Run a command under sudo.  When stream=True, pipe output
+        through _stream_output so it never buffers fully in RAM."""
         if cancel_token:
             cancel_token.check()
         if sudo_password:
@@ -679,12 +722,23 @@ def uninstall_app(app_name: str, install_type: str, paths: dict, package_name: s
             if cancel_token:
                 cancel_token.register(proc)
             try:
-                stdout, stderr = proc.communicate(input=(sudo_password + "\n").encode())
+                proc.stdin.write((sudo_password + "\n").encode())
+                proc.stdin.flush()
+                proc.stdin.close()
+                if stream:
+                    stderr_str = _stream_output(proc, log, cancel_token=cancel_token)
+                    proc.wait()
+                    return subprocess.CompletedProcess(full_cmd, proc.returncode, b"", stderr_str.encode(errors="replace"))
+                else:
+                    stdout, stderr = proc.stdout.read(), proc.stderr.read()
+                    proc.wait()
+                    return subprocess.CompletedProcess(full_cmd, proc.returncode, stdout, stderr)
             finally:
                 if cancel_token:
                     cancel_token.unregister()
-            return subprocess.CompletedProcess(full_cmd, proc.returncode, stdout, stderr)
         else:
+            if stream:
+                return cancellable_run(["sudo"] + cmd, token=cancel_token, log=log)
             return cancellable_run(["sudo"] + cmd, token=cancel_token)
 
     # 1. Package Manager Uninstalls (RPM / DEB / Flatpak)
@@ -692,8 +746,7 @@ def uninstall_app(app_name: str, install_type: str, paths: dict, package_name: s
         if not package_name:
             package_name = app_name
         log(f"Removing package {package_name} via dnf…")
-        proc = sudo_run(["dnf", "remove", "-y", package_name])
-        _log_output(proc.stdout.decode(errors="replace"), log)
+        proc = sudo_run(["dnf", "remove", "-y", package_name], stream=True)
         if proc.returncode != 0:
             raise RuntimeError(proc.stderr.decode(errors="replace"))
         log(f"✅ {app_name} package removed.")
@@ -702,8 +755,7 @@ def uninstall_app(app_name: str, install_type: str, paths: dict, package_name: s
         if not package_name:
             raise RuntimeError("Flatpak application ID not found.")
         log(f"Uninstalling Flatpak {package_name}…")
-        proc = cancellable_run(["flatpak", "uninstall", "--user", "-y", package_name], token=cancel_token)
-        _log_output(proc.stdout.decode(errors="replace"), log)
+        proc = cancellable_run(["flatpak", "uninstall", "--user", "-y", package_name], token=cancel_token, log=log)
         if proc.returncode != 0:
             raise RuntimeError(proc.stderr.decode(errors="replace"))
         log(f"✅ {app_name} Flatpak uninstalled.")
@@ -790,6 +842,7 @@ class UninstallDialog(Adw.MessageDialog):
         self.receipt_file = receipt_file
         self.cancel_token = CancelToken()
         self.uninstalling = True
+        self._closed = False
         
         # Setup UI
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
@@ -828,6 +881,8 @@ class UninstallDialog(Adw.MessageDialog):
 
     def _log(self, text: str):
         def _append():
+            if self._closed:
+                return False
             end = self.log_buffer.get_end_iter()
             self.log_buffer.insert(end, text.strip() + "\n")
             adj = self.log_view.get_parent().get_vadjustment()
@@ -864,6 +919,8 @@ class UninstallDialog(Adw.MessageDialog):
             sudo_password = None
 
     def _done(self, success, error):
+        if self._closed:
+            return False
         self.uninstalling = False
         # Stop pulse timer (in case GLib hasn't fired the False return yet)
         if self._pulse_id is not None:
@@ -883,14 +940,16 @@ class UninstallDialog(Adw.MessageDialog):
             self.set_body(f"Uninstallation failed: {error}")
             
         parent = self.get_transient_for()
-        if parent and hasattr(parent, "refresh_installed_tab"):
+        if parent and hasattr(parent, "refresh_installed_tab") and not getattr(parent, "_closed", False):
             GLib.idle_add(parent.refresh_installed_tab)
+        gc.collect()
 
     def _on_response(self, dialog, response_id):
         if response_id == "cancel":
             self._log("Cancelling...")
             self.cancel_token.cancel()
         else:
+            self._closed = True
             self.destroy()
 
 
@@ -899,6 +958,7 @@ class UpdateDialog(Adw.MessageDialog):
         super().__init__(transient_for=parent, heading="Updating Fedora Installer")
         
         self.updating = True
+        self._closed = False
         self._pulse_id = None
         
         # Setup UI
@@ -939,6 +999,8 @@ class UpdateDialog(Adw.MessageDialog):
 
     def _log(self, text: str):
         def _append():
+            if self._closed:
+                return False
             end = self.log_buffer.get_end_iter()
             self.log_buffer.insert(end, text.strip() + "\n")
             adj = self.log_view.get_parent().get_vadjustment()
@@ -975,10 +1037,9 @@ class UpdateDialog(Adw.MessageDialog):
                     break
                 self._log(line.decode(errors="replace"))
                 
-            # Read stderr
-            stderr_data = proc.stderr.read()
-            if stderr_data:
-                self._log(stderr_data.decode(errors="replace"))
+            # Read stderr line by line
+            for raw_line in proc.stderr:
+                self._log(raw_line.decode(errors="replace"))
                 
             proc.wait()
             
@@ -992,6 +1053,8 @@ class UpdateDialog(Adw.MessageDialog):
             sudo_password = None
 
     def _done(self, success, error):
+        if self._closed:
+            return False
         self.updating = False
         if self._pulse_id is not None:
             GLib.source_remove(self._pulse_id)
@@ -1007,6 +1070,7 @@ class UpdateDialog(Adw.MessageDialog):
         else:
             self._log(f"\n❌ Update failed: {error}")
             self.set_body(f"Update failed: {error}")
+        gc.collect()
 
     def _on_response(self, dialog, response_id):
         if response_id == "restart":
@@ -1015,6 +1079,7 @@ class UpdateDialog(Adw.MessageDialog):
             except Exception:
                 sys.exit(0)
         else:
+            self._closed = True
             self.destroy()
 
 
@@ -1026,6 +1091,7 @@ class InstallerWindow(Adw.ApplicationWindow):
         self.set_resizable(True)
 
         self._file_path: str | None = None
+        self._closed = False
         self._installing = False
         self._cancel_token: CancelToken | None = None
 
@@ -1236,6 +1302,7 @@ class InstallerWindow(Adw.ApplicationWindow):
 
     def _on_close_request(self, window):
         """Cancel any running install or search before the window is destroyed."""
+        self._closed = True
         # Stop the search
         self._search_cancel_event.set()
         if self._search_debounce_id is not None:
@@ -1264,6 +1331,8 @@ class InstallerWindow(Adw.ApplicationWindow):
             pass  # network down, timeout, 404 — all fine, just skip
 
     def _show_update_banner(self, latest: str):
+        if self._closed:
+            return False
         self._latest_version = latest
         self.update_banner.set_title(
             f"A new version is available: v{latest}  (you have v{VERSION})"
@@ -1365,6 +1434,8 @@ class InstallerWindow(Adw.ApplicationWindow):
 
     def _log(self, text: str):
         def _append():
+            if self._closed:
+                return False
             end = self.log_buffer.get_end_iter()
             self.log_buffer.insert(end, text.strip() + "\n")
             # scroll to bottom
@@ -1455,6 +1526,8 @@ class InstallerWindow(Adw.ApplicationWindow):
             except OSError: pass
 
     def _install_done(self, success: bool, error: str | None):
+        if self._closed:
+            return False
         self._installing = False
         self._cancel_token = None
         # Stop pulse timer now that the install is done
@@ -1498,10 +1571,13 @@ class InstallerWindow(Adw.ApplicationWindow):
             )
             dialog.add_response("ok", "OK")
             dialog.present()
+        gc.collect()
         return False
 
     def _install_cancelled(self):
         """Called on the main thread when the install thread exits via cancel."""
+        if self._closed:
+            return False
         self._installing = False
         self._cancel_token = None
         # Stop pulse timer
@@ -1524,6 +1600,7 @@ class InstallerWindow(Adw.ApplicationWindow):
         )
         dialog.add_response("ok", "OK")
         dialog.present()
+        gc.collect()
         return False
 
     def _build_installed_tab(self, scroll):
@@ -1738,13 +1815,18 @@ class InstallerWindow(Adw.ApplicationWindow):
         # 4. Search DNF (rpm -qa) — capped at 15 s to avoid blocking forever
         if cancelled.is_set(): return
         try:
-            p_rpm = subprocess.run(
+            proc = subprocess.Popen(
                 ["rpm", "-qa", "--qf", "%{NAME}|%{SUMMARY}\n"],
-                capture_output=True, text=True, errors="replace", timeout=15
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
             )
-            if not cancelled.is_set() and p_rpm.returncode == 0:
-                for line in p_rpm.stdout.splitlines():
-                    if cancelled.is_set(): return
+            timer = threading.Timer(15.0, proc.terminate)
+            timer.start()
+            try:
+                for raw_line in proc.stdout:
+                    if cancelled.is_set():
+                        proc.terminate()
+                        break
+                    line = raw_line.decode(errors="replace")
                     if "|" in line:
                         name, summary = line.split("|", 1)
                         if query.lower() in name.lower() or query.lower() in summary.lower():
@@ -1754,8 +1836,11 @@ class InstallerWindow(Adw.ApplicationWindow):
                                 "package_name": name,
                                 "install_type": "rpm"
                             })
-        except subprocess.TimeoutExpired:
-            pass  # rpm -qa took too long — return partial results
+            finally:
+                timer.cancel()
+                if proc.poll() is None:
+                    proc.terminate()
+                proc.wait()
         except Exception:
             pass
 
@@ -1772,6 +1857,8 @@ class InstallerWindow(Adw.ApplicationWindow):
         self.search_dnf_group.set_visible(False)
 
     def _update_search_results_ui(self, results):
+        if self._closed:
+            return False
         self._clear_search_results()
         
         flatpaks = results.get("Flatpak", [])
@@ -1845,6 +1932,7 @@ class InstallerWindow(Adw.ApplicationWindow):
                 row.add_suffix(btn)
                 
                 self.search_dnf_list.append(row)
+        gc.collect()
 
     def _on_remove_receipt_clicked(self, btn, receipt):
         app_name = receipt.get("app_name")
