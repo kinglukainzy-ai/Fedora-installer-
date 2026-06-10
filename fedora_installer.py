@@ -831,7 +831,7 @@ def uninstall_app(app_name: str, install_type: str, paths: dict, package_name: s
     log("Desktop database updated.")
 
 
-class UninstallDialog(Adw.MessageDialog):
+class UninstallDialog(Adw.AlertDialog):
     def __init__(self, parent, app_name, install_type, paths, package_name, receipt_file=None, sudo_password=None):
         super().__init__(transient_for=parent, heading=f"Uninstalling {app_name}")
         
@@ -953,7 +953,7 @@ class UninstallDialog(Adw.MessageDialog):
             self.destroy()
 
 
-class UpdateDialog(Adw.MessageDialog):
+class UpdateDialog(Adw.AlertDialog):
     def __init__(self, parent, sudo_password=None):
         super().__init__(transient_for=parent, heading="Updating Fedora Installer")
         
@@ -1342,9 +1342,8 @@ class InstallerWindow(Adw.ApplicationWindow):
 
     def _on_update_banner_clicked(self, banner):
         latest = getattr(self, "_latest_version", "latest")
-        dialog = Adw.MessageDialog(
-            transient_for=self,
-            heading="Update Available",
+        dialog = Adw.AlertDialog(
+                        heading="Update Available",
             body=f"Would you like to automatically update Fedora Installer to v{latest}?"
         )
         dialog.add_response("cancel", "Cancel")
@@ -1356,7 +1355,7 @@ class InstallerWindow(Adw.ApplicationWindow):
                 self._trigger_update_flow(latest)
                 
         dialog.connect("response", on_response)
-        dialog.present()
+        dialog.present(self)
 
     def _trigger_update_flow(self, latest):
         pwd = self.pwd_entry.get_text().strip() or None
@@ -1550,13 +1549,12 @@ class InstallerWindow(Adw.ApplicationWindow):
                 f"{app_name} installed",
                 "The app is now available in your GNOME launcher.",
             )
-            dialog = Adw.MessageDialog(
-                transient_for=self,
-                heading="Installed!",
+            dialog = Adw.AlertDialog(
+                                heading="Installed!",
                 body="The app is now available in your GNOME launcher.",
             )
             dialog.add_response("ok", "Great!")
-            dialog.present()
+            dialog.present(self)
         else:
             self._log(f"❌ Error: {error}")
             send_notification(
@@ -1564,13 +1562,12 @@ class InstallerWindow(Adw.ApplicationWindow):
                 str(error or "Unknown error"),
                 urgency="critical",
             )
-            dialog = Adw.MessageDialog(
-                transient_for=self,
-                heading="Installation failed",
+            dialog = Adw.AlertDialog(
+                                heading="Installation failed",
                 body=error or "Unknown error",
             )
             dialog.add_response("ok", "OK")
-            dialog.present()
+            dialog.present(self)
         gc.collect()
         return False
 
@@ -1593,13 +1590,12 @@ class InstallerWindow(Adw.ApplicationWindow):
             "The installation was cancelled. Partial files may remain.",
             urgency="low",
         )
-        dialog = Adw.MessageDialog(
-            transient_for=self,
-            heading="Cancelled",
+        dialog = Adw.AlertDialog(
+                        heading="Cancelled",
             body="The installation was cancelled. Partial files may remain.",
         )
         dialog.add_response("ok", "OK")
-        dialog.present()
+        dialog.present(self)
         gc.collect()
         return False
 
@@ -1964,9 +1960,8 @@ class InstallerWindow(Adw.ApplicationWindow):
         package_name = receipt.get("package_name")
         receipt_file = receipt.get("receipt_file")
         
-        dialog = Adw.MessageDialog(
-            transient_for=self,
-            heading="Uninstall Application?",
+        dialog = Adw.AlertDialog(
+                        heading="Uninstall Application?",
             body=f"Are you sure you want to uninstall {app_name}?"
         )
         dialog.add_response("cancel", "Cancel")
@@ -1986,13 +1981,12 @@ class InstallerWindow(Adw.ApplicationWindow):
                     self._start_uninstall(app_name, install_type, paths, package_name, receipt_file, None)
                     
         dialog.connect("response", on_confirm_response)
-        dialog.present()
+        dialog.present(self)
 
     def _on_remove_search_clicked(self, btn, item_type, name, path_or_pkg):
         if item_type == 'manual':
-            dialog = Adw.MessageDialog(
-                transient_for=self,
-                heading="Destructive Action Warning",
+            dialog = Adw.AlertDialog(
+                                heading="Destructive Action Warning",
                 body=f"Warning: This will delete the entire directory {path_or_pkg} and all of its contents. This action cannot be undone.\n\nAre you sure you want to proceed?"
             )
             dialog.add_response("cancel", "Cancel")
@@ -2000,9 +1994,8 @@ class InstallerWindow(Adw.ApplicationWindow):
             dialog.set_response_appearance("proceed", Adw.ResponseAppearance.DESTRUCTIVE)
             confirm_response_id = "proceed"
         else:
-            dialog = Adw.MessageDialog(
-                transient_for=self,
-                heading="Uninstall Application?",
+            dialog = Adw.AlertDialog(
+                                heading="Uninstall Application?",
                 body=f"Are you sure you want to uninstall {name}?"
             )
             dialog.add_response("cancel", "Cancel")
@@ -2047,12 +2040,11 @@ class InstallerWindow(Adw.ApplicationWindow):
                     self._start_uninstall(name, install_type, paths, package_name, None, None)
                     
         dialog.connect("response", on_confirm_response)
-        dialog.present()
+        dialog.present(self)
 
     def _prompt_sudo_password(self, message, callback):
-        dialog = Adw.MessageDialog(
-            transient_for=self,
-            heading="Authentication Required",
+        dialog = Adw.AlertDialog(
+                        heading="Authentication Required",
             body=message
         )
         
@@ -2079,7 +2071,7 @@ class InstallerWindow(Adw.ApplicationWindow):
                 password = None
                 
         dialog.connect("response", on_response)
-        dialog.present()
+        dialog.present(self)
 
     def _start_uninstall(self, app_name, install_type, paths, package_name, receipt_file, sudo_password):
         dlg = UninstallDialog(self, app_name, install_type, paths, package_name, receipt_file, sudo_password)
@@ -2280,9 +2272,8 @@ class PreferencesWindow(Adw.PreferencesDialog):
         self.update_btn.set_sensitive(True)
         self.update_btn.set_label("Update Available")
         
-        dialog = Adw.MessageDialog(
-            transient_for=self,
-            heading="Update Available",
+        dialog = Adw.AlertDialog(
+                        heading="Update Available",
             body=f"A new version (v{latest}) is available. Would you like to install it now?"
         )
         dialog.add_response("cancel", "Cancel")
@@ -2295,31 +2286,29 @@ class PreferencesWindow(Adw.PreferencesDialog):
                 parent._trigger_update_flow(latest)
                 
         dialog.connect("response", on_response)
-        dialog.present()
+        dialog.present(self)
 
     def _show_no_update(self):
         self.update_btn.set_sensitive(True)
         self.update_btn.set_label("Check")
         
-        dialog = Adw.MessageDialog(
-            transient_for=self,
-            heading="Up to Date",
+        dialog = Adw.AlertDialog(
+                        heading="Up to Date",
             body="You are already running the latest version of Fedora Installer."
         )
         dialog.add_response("ok", "OK")
-        dialog.present()
+        dialog.present(self)
 
     def _show_error(self, err_msg):
         self.update_btn.set_sensitive(True)
         self.update_btn.set_label("Check")
         
-        dialog = Adw.MessageDialog(
-            transient_for=self,
-            heading="Check Failed",
+        dialog = Adw.AlertDialog(
+                        heading="Check Failed",
             body=f"Could not check for updates:\n{err_msg}"
         )
         dialog.add_response("ok", "OK")
-        dialog.present()
+        dialog.present(self)
 
 
 class FedoraInstallerApp(Adw.Application):
