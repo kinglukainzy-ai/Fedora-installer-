@@ -21,12 +21,17 @@ sudo dnf install -y --skip-unavailable \
     libnotify || true
 
 # distrobox for .deb support
-read -rp "Install 'distrobox' for .deb support? [Y/n] " ans
+if [[ -t 0 ]]; then
+    read -rp "Install 'distrobox' for .deb support? [Y/n] " ans
+else
+    ans="y"
+fi
 if [[ ! "$ans" =~ ^[Nn]$ ]]; then
     sudo dnf install -y distrobox podman && echo "✔ distrobox installed"
 else
     echo "  Skipped distrobox — .deb files won't be supported."
 fi
+
 
 # ── install app ───────────────────────────────────────────────────────────────
 echo ""

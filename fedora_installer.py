@@ -788,7 +788,6 @@ class UninstallDialog(Adw.MessageDialog):
         self.paths = paths
         self.package_name = package_name
         self.receipt_file = receipt_file
-        self.sudo_password = sudo_password
         self.cancel_token = CancelToken()
         self.uninstalling = True
         
@@ -821,11 +820,11 @@ class UninstallDialog(Adw.MessageDialog):
         
         self.connect("response", self._on_response)
         
-        # Start pulse timer
-        self.pulse_id = GLib.timeout_add(100, self._pulse)
-        
+        # Start pulse timer — stored so we can cancel it in _done
+        self._pulse_id = GLib.timeout_add(100, self._pulse)
+
         # Start thread
-        threading.Thread(target=self._run_uninstall, daemon=True).start()
+        threading.Thread(target=self._run_uninstall, args=(sudo_password,), daemon=True).start()
 
     def _log(self, text: str):
         def _append():
@@ -839,13 +838,14 @@ class UninstallDialog(Adw.MessageDialog):
         if self.uninstalling:
             self.progress.pulse()
             return True
+        self._pulse_id = None
         return False
 
-    def _run_uninstall(self):
+    def _run_uninstall(self, sudo_password):
         try:
             uninstall_app(
                 self.app_name, self.install_type, self.paths, self.package_name,
-                self._log, sudo_password=self.sudo_password, cancel_token=self.cancel_token
+                self._log, sudo_password=sudo_password, cancel_token=self.cancel_token
             )
             # Delete receipt file if present and uninstallation was successful
             if self.receipt_file and os.path.exists(self.receipt_file):
@@ -860,9 +860,17 @@ class UninstallDialog(Adw.MessageDialog):
             GLib.idle_add(self._done, False, "Cancelled by user.")
         except Exception as e:
             GLib.idle_add(self._done, False, str(e))
+        finally:
+            sudo_password = None
 
     def _done(self, success, error):
         self.uninstalling = False
+        # Stop pulse timer (in case GLib hasn't fired the False return yet)
+        if self._pulse_id is not None:
+            GLib.source_remove(self._pulse_id)
+            self._pulse_id = None
+        # Clear the log buffer so repeated uninstalls don't grow it forever
+        self.log_buffer.set_text("")
         self.progress.set_visible(False)
         self.set_response_enabled("close", True)
         self.set_response_enabled("cancel", False)
@@ -886,6 +894,130 @@ class UninstallDialog(Adw.MessageDialog):
             self.destroy()
 
 
+class UpdateDialog(Adw.MessageDialog):
+    def __init__(self, parent, sudo_password=None):
+        super().__init__(transient_for=parent, heading="Updating Fedora Installer")
+        
+        self.updating = True
+        self._pulse_id = None
+        
+        # Setup UI
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        box.set_margin_top(12)
+        
+        self.progress = Gtk.ProgressBar()
+        self.progress.set_pulse_step(0.05)
+        box.append(self.progress)
+        
+        log_scroll = Gtk.ScrolledWindow()
+        log_scroll.set_size_request(450, 200)
+        log_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        self.log_view = Gtk.TextView()
+        self.log_view.set_editable(False)
+        self.log_view.set_monospace(True)
+        self.log_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.log_buffer = self.log_view.get_buffer()
+        log_scroll.set_child(self.log_view)
+        box.append(log_scroll)
+        
+        self.set_extra_child(box)
+        
+        # Responses
+        self.add_response("close", "Close")
+        self.add_response("restart", "Restart App")
+        self.set_response_appearance("restart", Adw.ResponseAppearance.SUGGESTED)
+        self.set_response_enabled("close", False)
+        self.set_response_enabled("restart", False)
+        
+        self.connect("response", self._on_response)
+        
+        # Start pulse timer
+        self._pulse_id = GLib.timeout_add(100, self._pulse)
+        
+        # Start thread
+        threading.Thread(target=self._run_update, args=(sudo_password,), daemon=True).start()
+
+    def _log(self, text: str):
+        def _append():
+            end = self.log_buffer.get_end_iter()
+            self.log_buffer.insert(end, text.strip() + "\n")
+            adj = self.log_view.get_parent().get_vadjustment()
+            adj.set_value(adj.get_upper() - adj.get_page_size())
+        GLib.idle_add(_append)
+
+    def _pulse(self):
+        if self.updating:
+            self.progress.pulse()
+            return True
+        self._pulse_id = None
+        return False
+
+    def _run_update(self, sudo_password):
+        try:
+            self._log("Starting Fedora Installer update process…")
+            cmd = ["sudo", "-S", "fedora-installer", "--update"]
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            
+            # Pipe password if provided
+            if sudo_password:
+                proc.stdin.write((sudo_password + "\n").encode())
+                proc.stdin.flush()
+            
+            # Read stdout line by line
+            while True:
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                self._log(line.decode(errors="replace"))
+                
+            # Read stderr
+            stderr_data = proc.stderr.read()
+            if stderr_data:
+                self._log(stderr_data.decode(errors="replace"))
+                
+            proc.wait()
+            
+            if proc.returncode == 0:
+                GLib.idle_add(self._done, True, None)
+            else:
+                GLib.idle_add(self._done, False, f"Update exited with code {proc.returncode}")
+        except Exception as e:
+            GLib.idle_add(self._done, False, str(e))
+        finally:
+            sudo_password = None
+
+    def _done(self, success, error):
+        self.updating = False
+        if self._pulse_id is not None:
+            GLib.source_remove(self._pulse_id)
+            self._pulse_id = None
+            
+        self.progress.set_visible(False)
+        self.set_response_enabled("close", True)
+        
+        if success:
+            self._log("\n✅ Update complete! Please restart the application to apply the update.")
+            self.set_body("Fedora Installer has been successfully updated.")
+            self.set_response_enabled("restart", True)
+        else:
+            self._log(f"\n❌ Update failed: {error}")
+            self.set_body(f"Update failed: {error}")
+
+    def _on_response(self, dialog, response_id):
+        if response_id == "restart":
+            try:
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+            except Exception:
+                sys.exit(0)
+        else:
+            self.destroy()
+
+
 class InstallerWindow(Adw.ApplicationWindow):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -899,7 +1031,9 @@ class InstallerWindow(Adw.ApplicationWindow):
 
         self._search_lock = threading.Lock()
         self._search_thread = None
-        self._search_cancelled = False
+        self._search_cancel_event = threading.Event()  # replaces bare bool — Event is thread-safe
+        self._search_debounce_id: int | None = None    # GLib timer id for keystroke debounce
+        self._pulse_id: int | None = None              # GLib timer id for install progress pulse
 
         # ── root box ──────────────────────────────────────────────────────────
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
@@ -918,7 +1052,7 @@ class InstallerWindow(Adw.ApplicationWindow):
 
         # ── update banner (hidden until a newer version is detected) ──────────
         self.update_banner = Adw.Banner()
-        self.update_banner.set_button_label("How to update")
+        self.update_banner.set_button_label("Update Now")
         self.update_banner.set_revealed(False)
         self.update_banner.connect("button-clicked", self._on_update_banner_clicked)
         root.append(self.update_banner)
@@ -1092,8 +1226,29 @@ class InstallerWindow(Adw.ApplicationWindow):
             Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
         )
 
+        # ── window close: cancel any active install / search ─────────────────
+        self.connect("close-request", self._on_close_request)
+
         # ── background update check ───────────────────────────────────────────
         threading.Thread(target=self._check_for_update, daemon=True).start()
+
+    # ── close-request ─────────────────────────────────────────────────────────
+
+    def _on_close_request(self, window):
+        """Cancel any running install or search before the window is destroyed."""
+        # Stop the search
+        self._search_cancel_event.set()
+        if self._search_debounce_id is not None:
+            GLib.source_remove(self._search_debounce_id)
+            self._search_debounce_id = None
+        # Stop the install
+        if self._installing and self._cancel_token:
+            self._cancel_token.cancel()
+        # Stop pulse timer so it doesn't fire against a destroyed widget
+        if self._pulse_id is not None:
+            GLib.source_remove(self._pulse_id)
+            self._pulse_id = None
+        return False  # allow the window to close
 
     # ── update check ──────────────────────────────────────────────────────────
 
@@ -1109,6 +1264,7 @@ class InstallerWindow(Adw.ApplicationWindow):
             pass  # network down, timeout, 404 — all fine, just skip
 
     def _show_update_banner(self, latest: str):
+        self._latest_version = latest
         self.update_banner.set_title(
             f"A new version is available: v{latest}  (you have v{VERSION})"
         )
@@ -1116,18 +1272,36 @@ class InstallerWindow(Adw.ApplicationWindow):
         return False
 
     def _on_update_banner_clicked(self, banner):
+        latest = getattr(self, "_latest_version", "latest")
         dialog = Adw.MessageDialog(
             transient_for=self,
-            heading="Update Fedora Installer",
-            body=(
-                "Run this command in a terminal:\n\n"
-                "  fedora-installer --update\n\n"
-                "This will download the latest version from GitHub "
-                "and re-run the setup script automatically."
-            ),
+            heading="Update Available",
+            body=f"Would you like to automatically update Fedora Installer to v{latest}?"
         )
-        dialog.add_response("ok", "Got it")
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("update", "Update Now")
+        dialog.set_response_appearance("update", Adw.ResponseAppearance.SUGGESTED)
+        
+        def on_response(dlg, response_id):
+            if response_id == "update":
+                self._trigger_update_flow(latest)
+                
+        dialog.connect("response", on_response)
         dialog.present()
+
+    def _trigger_update_flow(self, latest):
+        pwd = self.pwd_entry.get_text().strip() or None
+        if pwd:
+            self._start_update_dialog(pwd)
+        else:
+            self._prompt_sudo_password(
+                f"Updating Fedora Installer to v{latest} requires administrator privileges.",
+                self._start_update_dialog
+            )
+
+    def _start_update_dialog(self, pwd):
+        dlg = UpdateDialog(self, pwd)
+        dlg.present()
 
     # ── drag-and-drop callbacks ───────────────────────────────────────────────
 
@@ -1211,6 +1385,10 @@ class InstallerWindow(Adw.ApplicationWindow):
         self.progress.set_visible(True)
         app_name_override = self.name_entry.get_text().strip() or None
         sudo_password = self.pwd_entry.get_text().strip() or None
+        self.pwd_entry.set_text("")
+
+        # Clear log buffer so output from previous installs doesn't accumulate
+        self.log_buffer.set_text("")
 
         # pulse the progress bar on a timer
         self._pulse_id = GLib.timeout_add(100, self._pulse)
@@ -1244,6 +1422,8 @@ class InstallerWindow(Adw.ApplicationWindow):
             GLib.idle_add(self._install_cancelled)
         except Exception as e:
             GLib.idle_add(self._install_done, False, str(e))
+        finally:
+            sudo_password = None
 
     def _cleanup_partial(self, path, app_name_override, sudo_password):
         ftype = detect_type(path)
@@ -1277,13 +1457,17 @@ class InstallerWindow(Adw.ApplicationWindow):
     def _install_done(self, success: bool, error: str | None):
         self._installing = False
         self._cancel_token = None
+        # Stop pulse timer now that the install is done
+        if self._pulse_id is not None:
+            GLib.source_remove(self._pulse_id)
+            self._pulse_id = None
         self.progress.set_visible(False)
         self.cancel_btn.set_visible(False)
         self.install_btn.set_sensitive(True)
 
         if success:
             self._log("Installation complete!")
-            GLib.idle_add(self.refresh_installed_tab)
+            self.refresh_installed_tab()  # already on main thread via idle_add
             # Desktop notification — useful when the user switched windows
             app_name = (
                 self.name_entry.get_text().strip()
@@ -1320,6 +1504,10 @@ class InstallerWindow(Adw.ApplicationWindow):
         """Called on the main thread when the install thread exits via cancel."""
         self._installing = False
         self._cancel_token = None
+        # Stop pulse timer
+        if self._pulse_id is not None:
+            GLib.source_remove(self._pulse_id)
+            self._pulse_id = None
         self.progress.set_visible(False)
         self.cancel_btn.set_visible(False)
         self.install_btn.set_sensitive(True)
@@ -1463,25 +1651,35 @@ class InstallerWindow(Adw.ApplicationWindow):
         if not query:
             self._clear_search_results()
             return
-        
-        with self._search_lock:
-            self._search_cancelled = True
-            
-        threading.Thread(target=self._run_search, args=(query,), daemon=True).start()
+
+        # Cancel any in-flight search
+        self._search_cancel_event.set()
+
+        # Cancel pending debounce timer and start a fresh one (300 ms)
+        if self._search_debounce_id is not None:
+            GLib.source_remove(self._search_debounce_id)
+
+        def _fire():
+            self._search_debounce_id = None
+            # Reset the cancel flag and launch exactly one search thread
+            self._search_cancel_event.clear()
+            threading.Thread(target=self._run_search, args=(query,), daemon=True).start()
+            return False  # one-shot timer
+
+        self._search_debounce_id = GLib.timeout_add(300, _fire)
 
     def _run_search(self, query):
-        with self._search_lock:
-            self._search_cancelled = False
-            
         results = {"DNF": [], "Flatpak": [], "AppImage": [], "Manual": []}
         
+        cancelled = self._search_cancel_event
+
         # 1. Search AppImages
-        if self._search_cancelled: return
+        if cancelled.is_set(): return
         bin_dir = os.path.expanduser("~/.local/bin")
         if os.path.isdir(bin_dir):
             try:
                 for f in os.listdir(bin_dir):
-                    if self._search_cancelled: return
+                    if cancelled.is_set(): return
                     if f.lower().endswith(".appimage") and query.lower() in f.lower():
                         results["AppImage"].append({
                             "name": f.replace(".AppImage", "").replace(".appimage", ""),
@@ -1491,12 +1689,12 @@ class InstallerWindow(Adw.ApplicationWindow):
                 pass
 
         # 2. Search Manual (/opt)
-        if self._search_cancelled: return
+        if cancelled.is_set(): return
         opt_dir = "/opt"
         if os.path.isdir(opt_dir):
             try:
                 for d in os.listdir(opt_dir):
-                    if self._search_cancelled: return
+                    if cancelled.is_set(): return
                     full_path = os.path.join(opt_dir, d)
                     if os.path.isdir(full_path) and query.lower() in d.lower():
                         results["Manual"].append({
@@ -1507,12 +1705,12 @@ class InstallerWindow(Adw.ApplicationWindow):
                 pass
 
         # 3. Search Flatpak
-        if self._search_cancelled: return
+        if cancelled.is_set(): return
         try:
             p_user = subprocess.run(["flatpak", "list", "--app", "--user", "--json"], capture_output=True, text=True)
-            if not self._search_cancelled and p_user.returncode == 0 and p_user.stdout:
+            if not cancelled.is_set() and p_user.returncode == 0 and p_user.stdout:
                 for item in json.loads(p_user.stdout):
-                    if self._search_cancelled: return
+                    if cancelled.is_set(): return
                     name = item.get("name", "")
                     app_id = item.get("application_id", "")
                     if query.lower() in name.lower() or query.lower() in app_id.lower():
@@ -1522,9 +1720,9 @@ class InstallerWindow(Adw.ApplicationWindow):
                             "install_type": "flatpak"
                         })
             p_sys = subprocess.run(["flatpak", "list", "--app", "--system", "--json"], capture_output=True, text=True)
-            if not self._search_cancelled and p_sys.returncode == 0 and p_sys.stdout:
+            if not cancelled.is_set() and p_sys.returncode == 0 and p_sys.stdout:
                 for item in json.loads(p_sys.stdout):
-                    if self._search_cancelled: return
+                    if cancelled.is_set(): return
                     name = item.get("name", "")
                     app_id = item.get("application_id", "")
                     if query.lower() in name.lower() or query.lower() in app_id.lower():
@@ -1537,13 +1735,16 @@ class InstallerWindow(Adw.ApplicationWindow):
         except Exception:
             pass
 
-        # 4. Search DNF (using rpm -qa)
-        if self._search_cancelled: return
+        # 4. Search DNF (rpm -qa) — capped at 15 s to avoid blocking forever
+        if cancelled.is_set(): return
         try:
-            p_rpm = subprocess.run(["rpm", "-qa", "--qf", "%{NAME}|%{SUMMARY}\n"], capture_output=True, text=True, errors="replace")
-            if not self._search_cancelled and p_rpm.returncode == 0:
+            p_rpm = subprocess.run(
+                ["rpm", "-qa", "--qf", "%{NAME}|%{SUMMARY}\n"],
+                capture_output=True, text=True, errors="replace", timeout=15
+            )
+            if not cancelled.is_set() and p_rpm.returncode == 0:
                 for line in p_rpm.stdout.splitlines():
-                    if self._search_cancelled: return
+                    if cancelled.is_set(): return
                     if "|" in line:
                         name, summary = line.split("|", 1)
                         if query.lower() in name.lower() or query.lower() in summary.lower():
@@ -1553,10 +1754,12 @@ class InstallerWindow(Adw.ApplicationWindow):
                                 "package_name": name,
                                 "install_type": "rpm"
                             })
+        except subprocess.TimeoutExpired:
+            pass  # rpm -qa took too long — return partial results
         except Exception:
             pass
 
-        if not self._search_cancelled:
+        if not cancelled.is_set():
             GLib.idle_add(self._update_search_results_ui, results)
 
     def _clear_search_results(self):
@@ -1760,7 +1963,9 @@ class InstallerWindow(Adw.ApplicationWindow):
         def on_response(dlg, response_id):
             if response_id == "authenticate":
                 password = pwd_entry.get_text().strip()
+                pwd_entry.set_text("")
                 callback(password)
+                password = None
                 
         dialog.connect("response", on_response)
         dialog.present()
@@ -1917,6 +2122,23 @@ class PreferencesWindow(Adw.PreferencesDialog):
         self._db_check.connect("toggled", self._on_toggle)
         self._alien_check.connect("toggled", self._on_toggle)
 
+        # Update group
+        update_group = Adw.PreferencesGroup()
+        update_group.set_title("Updates")
+        update_group.set_description("Manage updates for Fedora Installer itself.")
+        page.add(update_group)
+
+        update_row = Adw.ActionRow()
+        update_row.set_title("Check for Updates Now")
+        update_row.set_subtitle(f"Current version: v{VERSION}")
+        
+        self.update_btn = Gtk.Button(label="Check")
+        self.update_btn.add_css_class("pill")
+        self.update_btn.set_valign(Gtk.Align.CENTER)
+        self.update_btn.connect("clicked", self._on_check_updates_clicked, parent)
+        update_row.add_suffix(self.update_btn)
+        update_group.add(update_row)
+
         self.present(parent)
 
     def _on_toggle(self, _btn):
@@ -1924,6 +2146,69 @@ class PreferencesWindow(Adw.PreferencesDialog):
         cfg = load_config()
         cfg["deb_method"] = method
         save_config(cfg)
+
+    def _on_check_updates_clicked(self, btn, parent):
+        btn.set_sensitive(False)
+        btn.set_label("Checking…")
+        
+        def _check():
+            try:
+                req = urllib.request.Request(VERSION_URL, method="GET")
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    latest = resp.read().decode().strip()
+                if latest and latest != VERSION:
+                    GLib.idle_add(self._show_update_available, parent, latest)
+                else:
+                    GLib.idle_add(self._show_no_update)
+            except Exception as e:
+                GLib.idle_add(self._show_error, str(e))
+                
+        threading.Thread(target=_check, daemon=True).start()
+
+    def _show_update_available(self, parent, latest):
+        self.update_btn.set_sensitive(True)
+        self.update_btn.set_label("Update Available")
+        
+        dialog = Adw.MessageDialog(
+            transient_for=self,
+            heading="Update Available",
+            body=f"A new version (v{latest}) is available. Would you like to install it now?"
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("update", "Update Now")
+        dialog.set_response_appearance("update", Adw.ResponseAppearance.SUGGESTED)
+        
+        def on_response(dlg, response_id):
+            if response_id == "update":
+                self.close()
+                parent._trigger_update_flow(latest)
+                
+        dialog.connect("response", on_response)
+        dialog.present()
+
+    def _show_no_update(self):
+        self.update_btn.set_sensitive(True)
+        self.update_btn.set_label("Check")
+        
+        dialog = Adw.MessageDialog(
+            transient_for=self,
+            heading="Up to Date",
+            body="You are already running the latest version of Fedora Installer."
+        )
+        dialog.add_response("ok", "OK")
+        dialog.present()
+
+    def _show_error(self, err_msg):
+        self.update_btn.set_sensitive(True)
+        self.update_btn.set_label("Check")
+        
+        dialog = Adw.MessageDialog(
+            transient_for=self,
+            heading="Check Failed",
+            body=f"Could not check for updates:\n{err_msg}"
+        )
+        dialog.add_response("ok", "OK")
+        dialog.present()
 
 
 class FedoraInstallerApp(Adw.Application):

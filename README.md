@@ -1,6 +1,6 @@
 # Fedora Installer
 
-![Version](https://img.shields.io/badge/version-1.2.0-blue)
+![Version](https://img.shields.io/badge/version-1.3.0-blue)
 ![License](https://img.shields.io/badge/license-GPL--3.0-green)
 
 A universal **GUI + CLI** installer for Fedora/GNOME.
@@ -239,6 +239,12 @@ This project is licensed under the **GNU General Public License v3.0** — see t
 ---
 
 ## Changelog
+
+### v1.3.0 (2026-06-10)
+
+- **GUI Self-Updating** — Added a built-in "Update Now" button directly in the update banner and a new "Check for Updates Now" settings row in the Preferences dialog. Updates run safely in a background thread and prompt for sudo authentication inline if needed.
+- **Improved Thread & Resource Safety** — Cleaned up all GLib timeout timers upon window close, implemented non-blocking keystroke debouncing for live search, and added a thread-safe cancellation event.
+- **Robust Search Timeout** — Set a timeout for DNF `rpm -qa` queries to ensure search doesn't block the UI indefinitely on extremely large package sets.
 
 ### v1.2.0 (2026-06-10)
 
