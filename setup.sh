@@ -20,13 +20,12 @@ sudo dnf install -y --skip-unavailable \
     tar \
     libnotify || true
 
-# alien is optional (for .deb support)
-echo ""
-read -rp "Install 'alien' for .deb → .rpm conversion? [y/N] " ans
-if [[ "${ans,,}" == "y" ]]; then
-    sudo dnf install -y alien && echo "✔ alien installed"
+# distrobox for .deb support
+read -rp "Install 'distrobox' for .deb support? [Y/n] " ans
+if [[ ! "$ans" =~ ^[Nn]$ ]]; then
+    sudo dnf install -y distrobox podman && echo "✔ distrobox installed"
 else
-    echo "  Skipped alien — .deb files won't be supported."
+    echo "  Skipped distrobox — .deb files won't be supported."
 fi
 
 # ── install app ───────────────────────────────────────────────────────────────

@@ -19,13 +19,41 @@
 # Usage:
 #   smart-install.sh /path/to/file.rpm
 #   smart-install.sh /path/to/app.tar.gz myapp
+#   smart-install.sh /path/to/app.deb --deb-method alien
+#   smart-install.sh /path/to/app.deb --deb-method distrobox
 set -euo pipefail
 
 FILE="${1:-}"
 APP_NAME_OVERRIDE="${2:-}"
+DEB_METHOD=""
+
+# Parse --deb-method flag (can appear anywhere after the file)
+for arg in "$@"; do
+    case "$arg" in
+        --deb-method=*) DEB_METHOD="${arg#*=}" ;;
+        --deb-method)   : ;;  # value handled below
+    esac
+done
+# Handle "--deb-method alien" (space-separated)
+for i in "${!@}"; do
+    if [[ "${!i}" == "--deb-method" ]]; then
+        next=$((i+1))
+        DEB_METHOD="${!next:-}"
+    fi
+done 2>/dev/null || true
+
+# Fall back to saved config if no flag
+if [[ -z "$DEB_METHOD" ]]; then
+    CONFIG_FILE="$HOME/.config/fedora-installer/config.json"
+    if [[ -f "$CONFIG_FILE" ]]; then
+        DEB_METHOD=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('deb_method','distrobox'))" "$CONFIG_FILE" 2>/dev/null || echo "distrobox")
+    else
+        DEB_METHOD="distrobox"
+    fi
+fi
 
 if [[ -z "$FILE" ]]; then
-    echo "Usage: smart-install.sh <file> [app-name]"
+    echo "Usage: smart-install.sh <file> [app-name] [--deb-method distrobox|alien]"
     exit 1
 fi
 
@@ -250,28 +278,64 @@ case "$TYPE" in
         ;;
 
     deb)
-        echo "▸ Converting .deb → .rpm via alien…"
-        TMP_DIR=$(mktemp -d)
-        
-        # Run alien with cwd in TMP_DIR
-        (cd "$TMP_DIR" && alien --to-rpm --scripts "$FILE")
-        
-        # Check if alien produced an .rpm file in TMP_DIR
-        rpm_files=("$TMP_DIR"/*.rpm)
-        if [[ ! -e "${rpm_files[0]}" ]]; then
+        install_deb_distrobox() {
+            echo "▸ Installing .deb via distrobox…"
+            if ! command -v distrobox &>/dev/null; then
+                echo "▸ distrobox not found — installing…"
+                sudo dnf install -y distrobox podman
+            elif ! command -v podman &>/dev/null && ! command -v docker &>/dev/null; then
+                echo "▸ podman not found — installing…"
+                sudo dnf install -y podman
+            fi
+            local CONTAINER_NAME="fedora-installer-debian"
+            if ! distrobox list 2>/dev/null | grep -q "$CONTAINER_NAME"; then
+                echo "▸ Creating Debian container '$CONTAINER_NAME' (first time only)…"
+                distrobox create --name "$CONTAINER_NAME" \
+                    --image quay.io/toolbx-images/debian-toolbox:testing --yes
+            fi
+            echo "▸ Installing $BASENAME inside container…"
+            distrobox enter "$CONTAINER_NAME" -- bash -c "
+                sudo apt-get update -qq &&
+                sudo apt-get install -y \'$FILE\' 2>&1
+            "
+            echo "▸ Exporting app to host launcher…"
+            distrobox enter "$CONTAINER_NAME" -- bash -c "
+                distrobox-export --app \'$APP_NAME\' 2>/dev/null || true
+            "
+            echo "✅ .deb installed via distrobox."
+        }
+
+        install_deb_alien() {
+            echo "▸ Installing .deb via alien…"
+            if ! command -v alien &>/dev/null; then
+                echo "▸ alien not found — installing…"
+                sudo dnf install -y alien
+            fi
+            local TMP_DIR
+            TMP_DIR=$(mktemp -d)
+            (cd "$TMP_DIR" && alien --to-rpm --scripts "$FILE")
+            local rpm_files=("$TMP_DIR"/*.rpm)
+            if [[ ! -e "${rpm_files[0]}" ]]; then
+                rm -rf "$TMP_DIR"
+                echo "❌ alien did not produce an .rpm file."
+                return 1
+            fi
+            local rpm_path="${rpm_files[0]}"
+            echo "▸ Installing converted RPM: $rpm_path"
+            sudo dnf install -y "$rpm_path"
             rm -rf "$TMP_DIR"
-            echo "❌ alien did not produce an .rpm file."
-            exit 1
+            echo "✅ .deb converted and installed via alien."
+        }
+
+        if [[ "$DEB_METHOD" == "alien" ]]; then
+            if ! install_deb_alien; then
+                echo "⚠️  alien failed — retrying with distrobox…"
+                install_deb_distrobox
+            fi
+        else
+            install_deb_distrobox
         fi
-        
-        rpm_path="${rpm_files[0]}"
-        PKG_NAME=$(rpm -qp --qf "%{NAME}" "$rpm_path" 2>/dev/null || true)
-        echo "▸ Installing converted RPM: $rpm_path via dnf…"
-        sudo dnf install -y "$rpm_path"
-        
-        rm -rf "$TMP_DIR"
-        echo "✅ .deb converted and installed."
-        write_receipt "$APP_NAME" "deb" "null" "null" "null" "null" "$PKG_NAME"
+        write_receipt "$APP_NAME" "deb" "null" "null" "null" "null" "$APP_NAME"
         ;;
 
     flatpak)
