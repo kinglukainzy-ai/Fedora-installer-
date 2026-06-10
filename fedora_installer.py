@@ -31,7 +31,7 @@ import threading
 import os
 import sys
 import re
-import signal
+import shlex
 import urllib.request
 import json
 import shutil
@@ -352,7 +352,6 @@ def install_file(path: str, app_name_override: str | None, log,
             return subprocess.CompletedProcess(full_cmd, proc.returncode, stdout, stderr)
         else:
             return cancellable_run(["sudo"] + cmd, token=cancel_token, **kwargs)
-        return proc
 
     # ── RPM ──────────────────────────────────────────────────────────────────
     if ftype == "rpm":
@@ -398,7 +397,7 @@ def install_file(path: str, app_name_override: str | None, log,
                 if proc.returncode != 0:
                     raise RuntimeError("Failed to create distrobox container.\n" + proc.stderr.decode(errors="replace"))
             log(f"▸ Installing {os.path.basename(path)} inside container…")
-            install_cmd = f"sudo apt-get update -qq && sudo apt-get install -y \'{path}\'"
+            install_cmd = f"sudo apt-get update -qq && sudo apt-get install -y {shlex.quote(path)}"
             proc = cancellable_run(
                 ["distrobox", "enter", CONTAINER, "--", "bash", "-c", install_cmd],
                 token=cancel_token,
@@ -816,8 +815,8 @@ class UninstallDialog(Adw.MessageDialog):
         
         # Responses
         self.add_response("cancel", "Cancel")
-        self.set_response_appearance("cancel", Adw.ResponseAppearance.DESTRUCTIVE)
         self.add_response("close", "Close")
+        self.set_response_appearance("close", Adw.ResponseAppearance.SUGGESTED)
         self.set_response_enabled("close", False)
         
         self.connect("response", self._on_response)
@@ -938,7 +937,6 @@ class InstallerWindow(Adw.ApplicationWindow):
 
         page_install = self.tab_view.append(scroll)
         page_install.set_title("Install")
-        page_install.set_closable(False)
 
         installed_scroll = Gtk.ScrolledWindow(vexpand=True)
         installed_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -946,7 +944,6 @@ class InstallerWindow(Adw.ApplicationWindow):
 
         page_installed = self.tab_view.append(installed_scroll)
         page_installed.set_title("Installed")
-        page_installed.set_closable(False)
 
         # Restore last-used tab
         cfg = load_config()
@@ -1933,6 +1930,7 @@ class FedoraInstallerApp(Adw.Application):
     def __init__(self):
         super().__init__(application_id=APP_ID)
         self.path_arg = None
+        self._first_launch_shown = False
 
     def do_activate(self):
         win = self.get_active_window()
@@ -1941,10 +1939,13 @@ class FedoraInstallerApp(Adw.Application):
             if self.path_arg:
                 win._set_file(self.path_arg)
         win.present()
-        # Show first-launch dialog if user hasn't chosen a deb method yet
-        cfg = load_config()
-        if not cfg.get("first_launch_done"):
-            GLib.idle_add(lambda: FirstLaunchDialog(win, lambda: None) or False)
+        # Show first-launch dialog once per process lifetime (not on every
+        # window raise / do_activate call).
+        if not self._first_launch_shown:
+            cfg = load_config()
+            if not cfg.get("first_launch_done"):
+                self._first_launch_shown = True
+                GLib.idle_add(lambda: FirstLaunchDialog(win, lambda: None) or False)
 
 
 def main():
