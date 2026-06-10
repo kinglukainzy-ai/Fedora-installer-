@@ -1,9 +1,18 @@
 # Fedora Installer
 
+![Version](https://img.shields.io/badge/version-1.2.0-blue)
+![License](https://img.shields.io/badge/license-GPL--3.0-green)
+
 A universal **GUI + CLI** installer for Fedora/GNOME.
 Drop any installer file — `.rpm`, `.deb`, `.flatpak`, `.AppImage`, tarball, or `.zip` — and it handles the rest.
 
 ![Fedora Installer](fedora-installer.png)
+
+### Screenshots
+
+| Install tab | Installed tab |
+|---|---|
+| ![Install tab](Pasted%20image.png) | ![Installed tab](Pasted%20image%20(2).png) |
 
 ---
 
@@ -17,7 +26,8 @@ Drop any installer file — `.rpm`, `.deb`, `.flatpak`, `.AppImage`, tarball, or
 - **Self-updating** — run `fedora-installer --update` to pull the latest release from GitHub
 - **Automatic update check** — the GUI quietly checks for new versions on startup and shows a non-blocking banner if one is available
 - **Nautilus integration** — right-click any supported file → **Scripts → Smart Install**
-- **Desktop notifications** — success/failure alerts via `notify-send`
+- **Desktop notifications** — `notify-send` toast on install complete, failed, or cancelled — you'll know even if you switched windows
+- **Last tab memory** — the app reopens on whichever tab (Install or Installed) you used last
 - **Auto app-name detection** — strips version suffixes, arch tags, and extensions
 - **Desktop entry creation** — installed apps appear in the GNOME launcher automatically
 - **Icon extraction** — pulls icons from AppImages, archives, and standard `hicolor`/`pixmaps` paths
@@ -225,3 +235,26 @@ Inspired by the lack of a universal installer on Fedora Linux.
 ## License
 
 This project is licensed under the **GNU General Public License v3.0** — see the [LICENSE](LICENSE) file for details.
+
+---
+
+## Changelog
+
+### v1.2.0 (2026-06-10)
+
+- **Notification on install complete** — a `notify-send` toast fires when an installation finishes (success, failure, or cancellation), so you know it's done even if you switched windows.
+- **Remember last tab** — the app reopens on whichever tab (Install or Installed) you used last. The preference is stored in `~/.config/fedora-installer/config.json`.
+
+### v1.1.0
+
+- Cancel button for in-progress installs with partial-file cleanup
+- System-wide search across DNF, Flatpak, AppImages, and `/opt/`
+- Uninstall support with JSON receipt tracking
+- Preferences window for `.deb` install method
+- First-launch dialog
+- `/var/tmp` extraction to avoid RAM-limited tmpfs
+- Pre-flight disk space check
+
+### v1.0.0
+
+- Initial release — GUI + CLI installer for `.rpm`, `.deb`, `.flatpak`, `.AppImage`, tarball, and `.zip`

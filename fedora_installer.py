@@ -245,6 +245,53 @@ def find_executable(directory: str) -> str | None:
     return None
 
 
+# ── Config ────────────────────────────────────────────────────────────────────
+CONFIG_DIR  = os.path.expanduser("~/.config/fedora-installer")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+
+DEFAULTS = {
+    "deb_method":        None,   # None = not chosen yet (triggers first-launch dialog)
+    "first_launch_done": False,
+    "last_tab":          0,      # 0 = Install, 1 = Installed
+}
+
+def load_config() -> dict:
+    try:
+        with open(CONFIG_FILE) as f:
+            data = json.load(f)
+        for k, v in DEFAULTS.items():
+            data.setdefault(k, v)
+        return data
+    except (OSError, json.JSONDecodeError):
+        return dict(DEFAULTS)
+
+def save_config(cfg: dict) -> None:
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+def send_notification(summary: str, body: str = "", urgency: str = "normal") -> None:
+    """Fire a desktop notification via notify-send (non-blocking, best-effort)."""
+    try:
+        cmd = [
+            "notify-send",
+            "--app-name", "Fedora Installer",
+            "--icon", "system-software-install",
+            "--urgency", urgency,
+            summary,
+        ]
+        if body:
+            cmd.append(body)
+        subprocess.Popen(cmd, close_fds=True)
+    except Exception:
+        pass  # notify-send not available — silently skip
+
+
+def get_deb_method() -> str:
+    """Return saved deb method, defaulting to distrobox."""
+    return load_config().get("deb_method") or "distrobox"
+
+
 def write_receipt(app_name: str, install_type: str, paths: dict, package_name: str | None = None):
     """Write a JSON receipt of the installation to ~/.local/share/fedora-installer/receipts/"""
     receipts_dir = os.path.expanduser("~/.local/share/fedora-installer/receipts")
@@ -268,12 +315,16 @@ def write_receipt(app_name: str, install_type: str, paths: dict, package_name: s
 
 def install_file(path: str, app_name_override: str | None, log,
                  sudo_password: str | None = None,
-                 cancel_token: CancelToken | None = None):
+                 cancel_token: CancelToken | None = None,
+                 deb_method: str | None = None):
     """
     Core installer. Calls log(str) for progress. Raises on fatal error.
     sudo_password: if provided, piped into sudo -S.
     cancel_token: if provided, checked between steps and used to kill subprocesses.
+    deb_method: "distrobox" or "alien". Falls back to saved config if None.
     """
+    if deb_method is None:
+        deb_method = get_deb_method()
     ftype = detect_type(path)
     app_name = app_name_override or app_name_from_path(path)
     # Sanitize: replace whitespace with hyphens for safe filesystem paths
@@ -326,41 +377,76 @@ def install_file(path: str, app_name_override: str | None, log,
 
     # ── DEB ──────────────────────────────────────────────────────────────────
     elif ftype == "deb":
-        log("Converting .deb → .rpm via alien…")
-        # Fix #4: use a temp dir so we never pollute CWD or fail on read-only dirs
-        with tempfile.TemporaryDirectory() as tmpdir:
-            conv = cancellable_run(
-                ["alien", "--to-rpm", "--scripts", path],
-                token=cancel_token,
-                cwd=tmpdir,
-            )
-            _log_output(conv.stdout.decode(errors="replace"), log)
-            if conv.returncode != 0:
-                raise RuntimeError(
-                    "alien failed (is it installed? run: sudo dnf install -y alien)\n"
-                    + conv.stderr.decode(errors="replace")
+        def _install_deb_distrobox():
+            CONTAINER = "fedora-installer-debian"
+            log("▸ Installing .deb via distrobox…")
+            if subprocess.run(["which", "distrobox"], capture_output=True).returncode != 0:
+                log("▸ distrobox not found — installing…")
+                proc = sudo_run(["dnf", "install", "-y", "distrobox", "podman"])
+                _log_output(proc.stdout.decode(errors="replace"), log)
+                if proc.returncode != 0:
+                    raise RuntimeError("Failed to install distrobox.\n" + proc.stderr.decode(errors="replace"))
+            existing = subprocess.run(["distrobox", "list"], capture_output=True, text=True)
+            if CONTAINER not in existing.stdout:
+                log(f"▸ Creating Debian container '{CONTAINER}' (first time only — may take a minute)…")
+                proc = cancellable_run(
+                    ["distrobox", "create", "--name", CONTAINER,
+                     "--image", "quay.io/toolbx-images/debian-toolbox:testing", "--yes"],
+                    token=cancel_token,
                 )
-            rpm_files = [f for f in os.listdir(tmpdir) if f.endswith(".rpm")]
-            if not rpm_files:
-                raise RuntimeError("alien did not produce an .rpm file.")
-            rpm_path = os.path.join(tmpdir, rpm_files[0])
-            
-            package_name = None
-            try:
-                pkg_proc = cancellable_run(["rpm", "-qp", "--qf", "%{NAME}", rpm_path], token=cancel_token)
-                if pkg_proc.returncode == 0:
-                    package_name = pkg_proc.stdout.decode(errors="replace").strip()
-                    log(f"Queried converted RPM package name: {package_name}")
-            except Exception as e:
-                log(f"⚠️  Could not query converted RPM package name: {e}")
-
-            log(f"Installing converted RPM: {rpm_path}")
-            proc = sudo_run(["dnf", "install", "-y", rpm_path])
+                _log_output(proc.stdout.decode(errors="replace"), log)
+                if proc.returncode != 0:
+                    raise RuntimeError("Failed to create distrobox container.\n" + proc.stderr.decode(errors="replace"))
+            log(f"▸ Installing {os.path.basename(path)} inside container…")
+            install_cmd = f"sudo apt-get update -qq && sudo apt-get install -y \'{path}\'"
+            proc = cancellable_run(
+                ["distrobox", "enter", CONTAINER, "--", "bash", "-c", install_cmd],
+                token=cancel_token,
+            )
             _log_output(proc.stdout.decode(errors="replace"), log)
             if proc.returncode != 0:
-                raise RuntimeError(proc.stderr.decode(errors="replace"))
-        log("✅ .deb converted and installed.")
-        write_receipt(app_name, "deb", {}, package_name)
+                raise RuntimeError("apt install failed inside container.\n" + proc.stderr.decode(errors="replace"))
+            log("▸ Exporting app to host launcher…")
+            export_cmd = f"distrobox-export --app \'{app_name}\' 2>/dev/null || true"
+            cancellable_run(["distrobox", "enter", CONTAINER, "--", "bash", "-c", export_cmd], token=cancel_token)
+            log("✅ .deb installed via distrobox.")
+
+        def _install_deb_alien():
+            log("▸ Installing .deb via alien…")
+            if subprocess.run(["which", "alien"], capture_output=True).returncode != 0:
+                log("▸ alien not found — installing…")
+                proc = sudo_run(["dnf", "install", "-y", "alien"])
+                _log_output(proc.stdout.decode(errors="replace"), log)
+                if proc.returncode != 0:
+                    raise RuntimeError("Failed to install alien.\n" + proc.stderr.decode(errors="replace"))
+            with tempfile.TemporaryDirectory() as tmpdir:
+                conv = cancellable_run(["alien", "--to-rpm", "--scripts", path], token=cancel_token, cwd=tmpdir)
+                _log_output(conv.stdout.decode(errors="replace"), log)
+                if conv.returncode != 0:
+                    raise RuntimeError("alien failed.\n" + conv.stderr.decode(errors="replace"))
+                rpm_files = [f for f in os.listdir(tmpdir) if f.endswith(".rpm")]
+                if not rpm_files:
+                    raise RuntimeError("alien did not produce an .rpm file.")
+                rpm_path = os.path.join(tmpdir, rpm_files[0])
+                log(f"▸ Installing converted RPM: {rpm_path}")
+                proc = sudo_run(["dnf", "install", "-y", rpm_path])
+                _log_output(proc.stdout.decode(errors="replace"), log)
+                if proc.returncode != 0:
+                    raise RuntimeError(proc.stderr.decode(errors="replace"))
+            log("✅ .deb converted and installed via alien.")
+
+        # Use chosen method, with fallback to distrobox if alien fails
+        if deb_method == "alien":
+            try:
+                _install_deb_alien()
+            except RuntimeError as alien_err:
+                log(f"⚠️  alien failed: {alien_err}")
+                log("▸ Retrying with distrobox…")
+                _install_deb_distrobox()
+        else:
+            _install_deb_distrobox()
+
+        write_receipt(app_name, "deb", {}, app_name)
 
     # ── FLATPAK ───────────────────────────────────────────────────────────────
     elif ftype == "flatpak":
@@ -811,7 +897,7 @@ class InstallerWindow(Adw.ApplicationWindow):
         self._file_path: str | None = None
         self._installing = False
         self._cancel_token: CancelToken | None = None
-        
+
         self._search_lock = threading.Lock()
         self._search_thread = None
         self._search_cancelled = False
@@ -824,6 +910,12 @@ class InstallerWindow(Adw.ApplicationWindow):
         header = Adw.HeaderBar()
         header.add_css_class("flat")
         root.append(header)
+
+        # Preferences button (gear icon)
+        prefs_btn = Gtk.Button(icon_name="preferences-system-symbolic")
+        prefs_btn.set_tooltip_text("Preferences")
+        prefs_btn.connect("clicked", lambda _: PreferencesWindow(self))
+        header.pack_end(prefs_btn)
 
         # ── update banner (hidden until a newer version is detected) ──────────
         self.update_banner = Adw.Banner()
@@ -846,13 +938,24 @@ class InstallerWindow(Adw.ApplicationWindow):
 
         page_install = self.tab_view.append(scroll)
         page_install.set_title("Install")
+        page_install.set_closable(False)
 
         installed_scroll = Gtk.ScrolledWindow(vexpand=True)
         installed_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         self._build_installed_tab(installed_scroll)
-        
+
         page_installed = self.tab_view.append(installed_scroll)
         page_installed.set_title("Installed")
+        page_installed.set_closable(False)
+
+        # Restore last-used tab
+        cfg = load_config()
+        last_tab = cfg.get("last_tab", 0)
+        if last_tab == 1:
+            self.tab_view.set_selected_page(page_installed)
+
+        # Persist tab choice whenever the user switches
+        self.tab_view.connect("notify::selected-page", self._on_tab_changed)
 
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
         content.set_margin_top(32)
@@ -1184,6 +1287,15 @@ class InstallerWindow(Adw.ApplicationWindow):
         if success:
             self._log("Installation complete!")
             GLib.idle_add(self.refresh_installed_tab)
+            # Desktop notification — useful when the user switched windows
+            app_name = (
+                self.name_entry.get_text().strip()
+                or (os.path.basename(self._file_path) if self._file_path else "App")
+            )
+            send_notification(
+                f"{app_name} installed",
+                "The app is now available in your GNOME launcher.",
+            )
             dialog = Adw.MessageDialog(
                 transient_for=self,
                 heading="Installed!",
@@ -1193,6 +1305,11 @@ class InstallerWindow(Adw.ApplicationWindow):
             dialog.present()
         else:
             self._log(f"❌ Error: {error}")
+            send_notification(
+                "Installation failed",
+                str(error or "Unknown error"),
+                urgency="critical",
+            )
             dialog = Adw.MessageDialog(
                 transient_for=self,
                 heading="Installation failed",
@@ -1210,6 +1327,11 @@ class InstallerWindow(Adw.ApplicationWindow):
         self.cancel_btn.set_visible(False)
         self.install_btn.set_sensitive(True)
         self._log("Installation cancelled.")
+        send_notification(
+            "Installation cancelled",
+            "The installation was cancelled. Partial files may remain.",
+            urgency="low",
+        )
         dialog = Adw.MessageDialog(
             transient_for=self,
             heading="Cancelled",
@@ -1307,7 +1429,7 @@ class InstallerWindow(Adw.ApplicationWindow):
             
             for r in receipts:
                 row = Adw.ActionRow()
-                row.set_title(GLib.markup_escape_text(r.get("app_name", "Unknown App")))
+                row.set_title(r.get("app_name", "Unknown App"))
                 
                 installed_at = r.get("installed_at", "")
                 try:
@@ -1317,7 +1439,7 @@ class InstallerWindow(Adw.ApplicationWindow):
                     
                 paths = r.get("paths", {})
                 path_val = paths.get("install_dir") or paths.get("desktop_entry") or r.get("package_name") or ""
-                row.set_subtitle(GLib.markup_escape_text(f"Installed: {date_str}  ·  {path_val}"))
+                row.set_subtitle(f"Installed: {date_str}  ·  {path_val}")
                 
                 itype = r.get("install_type", "unknown")
                 badge = Gtk.Label(label=itype.upper())
@@ -1457,8 +1579,8 @@ class InstallerWindow(Adw.ApplicationWindow):
             self.search_flatpak_group.set_visible(True)
             for item in flatpaks:
                 row = Adw.ActionRow()
-                row.set_title(GLib.markup_escape_text(item["name"]))
-                row.set_subtitle(GLib.markup_escape_text(item["package_name"]))
+                row.set_title(item["name"])
+                row.set_subtitle(item["package_name"])
                 
                 btn = Gtk.Button()
                 btn.set_icon_name("user-trash-symbolic")
@@ -1475,8 +1597,8 @@ class InstallerWindow(Adw.ApplicationWindow):
             self.search_appimage_group.set_visible(True)
             for item in appimages:
                 row = Adw.ActionRow()
-                row.set_title(GLib.markup_escape_text(item["name"]))
-                row.set_subtitle(GLib.markup_escape_text(item["path"]))
+                row.set_title(item["name"])
+                row.set_subtitle(item["path"])
                 
                 btn = Gtk.Button()
                 btn.set_icon_name("user-trash-symbolic")
@@ -1493,8 +1615,8 @@ class InstallerWindow(Adw.ApplicationWindow):
             self.search_manual_group.set_visible(True)
             for item in manual:
                 row = Adw.ActionRow()
-                row.set_title(GLib.markup_escape_text(item["name"]))
-                row.set_subtitle(GLib.markup_escape_text(item["path"]))
+                row.set_title(item["name"])
+                row.set_subtitle(item["path"])
                 
                 btn = Gtk.Button()
                 btn.set_icon_name("user-trash-symbolic")
@@ -1511,8 +1633,8 @@ class InstallerWindow(Adw.ApplicationWindow):
             self.search_dnf_group.set_visible(True)
             for item in dnf[:50]:
                 row = Adw.ActionRow()
-                row.set_title(GLib.markup_escape_text(item["name"]))
-                row.set_subtitle(GLib.markup_escape_text(item.get("summary", "")))
+                row.set_title(item["name"])
+                row.set_subtitle(item.get("summary", ""))
                 
                 btn = Gtk.Button()
                 btn.set_icon_name("user-trash-symbolic")
@@ -1626,7 +1748,9 @@ class InstallerWindow(Adw.ApplicationWindow):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         box.set_margin_top(8)
         
-        pwd_entry = Gtk.PasswordEntry(placeholder_text="Password")
+        pwd_entry = Gtk.PasswordEntry()
+        pwd_entry.set_placeholder_text("Password")
+        pwd_entry.set_activates_default(True)
         box.append(pwd_entry)
         
         dialog.set_extra_child(box)
@@ -1648,6 +1772,162 @@ class InstallerWindow(Adw.ApplicationWindow):
         dlg = UninstallDialog(self, app_name, install_type, paths, package_name, receipt_file, sudo_password)
         dlg.present()
 
+    def _on_tab_changed(self, tab_view, _param):
+        """Persist the currently active tab index to config.json."""
+        pages = tab_view.get_pages()
+        selected = tab_view.get_selected_page()
+        for i in range(pages.get_n_items()):
+            if pages.get_item(i) == selected:
+                cfg = load_config()
+                cfg["last_tab"] = i
+                save_config(cfg)
+                break
+
+
+
+# ── First-launch dialog ───────────────────────────────────────────────────────
+class FirstLaunchDialog(Adw.Window):
+    """Shown once to let the user pick their .deb install method."""
+
+    def __init__(self, parent, on_done):
+        super().__init__(transient_for=parent, modal=True)
+        self.set_title("Welcome to Fedora Installer")
+        self.set_default_size(420, -1)
+        self.set_resizable(False)
+        self._on_done = on_done
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.set_content(box)
+
+        header = Adw.HeaderBar()
+        header.set_show_end_title_buttons(False)
+        box.append(header)
+
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=20)
+        inner.set_margin_top(24)
+        inner.set_margin_bottom(24)
+        inner.set_margin_start(28)
+        inner.set_margin_end(28)
+        box.append(inner)
+
+        # Icon + title
+        icon = Gtk.Image.new_from_icon_name("system-software-install")
+        icon.set_pixel_size(56)
+        inner.append(icon)
+
+        title = Gtk.Label(label="Choose your .deb install method")
+        title.add_css_class("title-2")
+        title.set_wrap(True)
+        title.set_justify(Gtk.Justification.CENTER)
+        inner.append(title)
+
+        sub = Gtk.Label(
+            label="This only applies to .deb files. You can change it later in Preferences."
+        )
+        sub.set_wrap(True)
+        sub.set_justify(Gtk.Justification.CENTER)
+        sub.add_css_class("dim-label")
+        inner.append(sub)
+
+        # Choice group
+        group = Adw.PreferencesGroup()
+        inner.append(group)
+
+        # distrobox row
+        db_row = Adw.ActionRow()
+        db_row.set_title("distrobox  <span weight=\'bold\' foreground=\'#3584e4\'>Recommended</span>")
+        db_row.set_title_use_markup(True)
+        db_row.set_subtitle("Installs inside a Debian container — reliable for any .deb")
+        self._db_check = Gtk.CheckButton()
+        self._db_check.set_active(True)
+        db_row.add_prefix(self._db_check)
+        db_row.set_activatable_widget(self._db_check)
+        group.add(db_row)
+
+        # alien row
+        alien_row = Adw.ActionRow()
+        alien_row.set_title("alien")
+        alien_row.set_subtitle("Converts .deb → .rpm — lighter but may fail on complex packages")
+        self._alien_check = Gtk.CheckButton()
+        self._alien_check.set_group(self._db_check)
+        alien_row.add_prefix(self._alien_check)
+        alien_row.set_activatable_widget(self._alien_check)
+        group.add(alien_row)
+
+        # Confirm button
+        confirm_btn = Gtk.Button(label="Confirm & Continue")
+        confirm_btn.add_css_class("suggested-action")
+        confirm_btn.add_css_class("pill")
+        confirm_btn.set_halign(Gtk.Align.CENTER)
+        confirm_btn.connect("clicked", self._on_confirm)
+        inner.append(confirm_btn)
+
+    def _on_confirm(self, _btn):
+        method = "alien" if self._alien_check.get_active() else "distrobox"
+        cfg = load_config()
+        cfg["deb_method"] = method
+        cfg["first_launch_done"] = True
+        save_config(cfg)
+        self.close()
+        self._on_done()
+
+
+# ── Preferences window ────────────────────────────────────────────────────────
+class PreferencesWindow(Adw.PreferencesDialog):
+    """Settings panel accessible from the header bar gear icon."""
+
+    def __init__(self, parent):
+        super().__init__()
+        self.set_title("Preferences")
+        self.set_search_enabled(False)
+
+        page = Adw.PreferencesPage()
+        page.set_title("General")
+        page.set_icon_name("preferences-system-symbolic")
+        self.add(page)
+
+        # .deb method group
+        deb_group = Adw.PreferencesGroup()
+        deb_group.set_title(".deb Install Method")
+        deb_group.set_description(
+            "How Fedora Installer handles .deb packages. "
+            "distrobox is more reliable; alien is faster but may fail."
+        )
+        page.add(deb_group)
+
+        cfg = load_config()
+        current = cfg.get("deb_method") or "distrobox"
+
+        db_row = Adw.ActionRow()
+        db_row.set_title("distrobox")
+        db_row.set_subtitle("Recommended — installs inside a Debian container")
+        self._db_check = Gtk.CheckButton()
+        self._db_check.set_active(current == "distrobox")
+        db_row.add_prefix(self._db_check)
+        db_row.set_activatable_widget(self._db_check)
+        deb_group.add(db_row)
+
+        alien_row = Adw.ActionRow()
+        alien_row.set_title("alien")
+        alien_row.set_subtitle("Converts .deb → .rpm — lighter but may fail on complex packages")
+        self._alien_check = Gtk.CheckButton()
+        self._alien_check.set_group(self._db_check)
+        self._alien_check.set_active(current == "alien")
+        alien_row.add_prefix(self._alien_check)
+        alien_row.set_activatable_widget(self._alien_check)
+        deb_group.add(alien_row)
+
+        self._db_check.connect("toggled", self._on_toggle)
+        self._alien_check.connect("toggled", self._on_toggle)
+
+        self.present(parent)
+
+    def _on_toggle(self, _btn):
+        method = "alien" if self._alien_check.get_active() else "distrobox"
+        cfg = load_config()
+        cfg["deb_method"] = method
+        save_config(cfg)
+
 
 class FedoraInstallerApp(Adw.Application):
     def __init__(self):
@@ -1661,6 +1941,10 @@ class FedoraInstallerApp(Adw.Application):
             if self.path_arg:
                 win._set_file(self.path_arg)
         win.present()
+        # Show first-launch dialog if user hasn't chosen a deb method yet
+        cfg = load_config()
+        if not cfg.get("first_launch_done"):
+            GLib.idle_add(lambda: FirstLaunchDialog(win, lambda: None) or False)
 
 
 def main():
