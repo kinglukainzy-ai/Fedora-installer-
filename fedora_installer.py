@@ -1833,7 +1833,7 @@ class FirstLaunchDialog(Adw.Window):
         # distrobox row
         db_row = Adw.ActionRow()
         db_row.set_title("distrobox  <span weight=\'bold\' foreground=\'#3584e4\'>Recommended</span>")
-        db_row.set_title_use_markup(True)
+        db_row.set_use_markup(True)
         db_row.set_subtitle("Installs inside a Debian container — reliable for any .deb")
         self._db_check = Gtk.CheckButton()
         self._db_check.set_active(True)
