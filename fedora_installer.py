@@ -880,13 +880,16 @@ class UninstallDialog(Adw.AlertDialog):
         threading.Thread(target=self._run_uninstall, args=(sudo_password,), daemon=True).start()
 
     def _log(self, text: str):
+        buf = self.log_buffer
+        adj = self._log_adj
+        closed = self
         def _append():
-            if self._closed:
+            if closed._closed:
                 return False
-            end = self.log_buffer.get_end_iter()
-            self.log_buffer.insert(end, text.strip() + "\n")
-            adj = self.log_view.get_parent().get_vadjustment()
-            adj.set_value(adj.get_upper() - adj.get_page_size())
+            end = buf.get_end_iter()
+            buf.insert(end, text.strip() + "\n")
+            adj.set_value(adj.get_upper())
+            return False
         GLib.idle_add(_append)
 
     def _pulse(self):
@@ -998,13 +1001,16 @@ class UpdateDialog(Adw.AlertDialog):
         threading.Thread(target=self._run_update, args=(sudo_password,), daemon=True).start()
 
     def _log(self, text: str):
+        buf = self.log_buffer
+        adj = self._log_adj
+        closed = self
         def _append():
-            if self._closed:
+            if closed._closed:
                 return False
-            end = self.log_buffer.get_end_iter()
-            self.log_buffer.insert(end, text.strip() + "\n")
-            adj = self.log_view.get_parent().get_vadjustment()
-            adj.set_value(adj.get_upper() - adj.get_page_size())
+            end = buf.get_end_iter()
+            buf.insert(end, text.strip() + "\n")
+            adj.set_value(adj.get_upper())
+            return False
         GLib.idle_add(_append)
 
     def _pulse(self):
@@ -1300,6 +1306,7 @@ class InstallerWindow(Adw.ApplicationWindow):
         log_scroll.set_child(self.log_view)
         log_frame.set_child(log_scroll)
         content.append(log_frame)
+        self._log_scroll_adj = log_scroll.get_vadjustment()  # cached — avoids get_parent() in _log
 
         # ── CSS ───────────────────────────────────────────────────────────────
         # CSS is loaded once at module level — see _APP_CSS_PROVIDER below
@@ -1448,14 +1455,18 @@ class InstallerWindow(Adw.ApplicationWindow):
         self._log(f"Selected: {path}")
 
     def _log(self, text: str):
+        import weakref
+        buf = self.log_buffer          # direct ref to buffer — no tree walk
+        adj = self._log_scroll_adj     # cached on init — no get_parent() call
+        closed_ref = weakref.ref(self)
         def _append():
-            if self._closed:
+            win = closed_ref()
+            if win is None or win._closed:
                 return False
-            end = self.log_buffer.get_end_iter()
-            self.log_buffer.insert(end, text.strip() + "\n")
-            # scroll to bottom
-            adj = self.log_view.get_parent().get_vadjustment()
-            adj.set_value(adj.get_upper() - adj.get_page_size())
+            end = buf.get_end_iter()
+            buf.insert(end, text.strip() + "\n")
+            adj.set_value(adj.get_upper())
+            return False
         GLib.idle_add(_append)
 
     # ── install ───────────────────────────────────────────────────────────────
