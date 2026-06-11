@@ -1083,6 +1083,48 @@ class UpdateDialog(Adw.AlertDialog):
             self.destroy()
 
 
+# ── CSS provider (singleton — loaded once, never duplicated) ─────────────────
+_APP_CSS_PROVIDER: "Gtk.CssProvider | None" = None
+
+def _ensure_css_loaded() -> None:
+    global _APP_CSS_PROVIDER
+    if _APP_CSS_PROVIDER is not None:
+        return  # already loaded
+    _APP_CSS_PROVIDER = Gtk.CssProvider()
+    _APP_CSS_PROVIDER.load_from_data(b"""
+.drop-area {
+    border-radius: 16px;
+    border: 2px dashed alpha(@accent_color, 0.4);
+    background: alpha(@accent_color, 0.04);
+    padding: 24px;
+    transition: border-color 200ms, background 200ms;
+}
+.drop-area.drag-over {
+    border-color: @accent_color;
+    background: alpha(@accent_color, 0.10);
+}
+.badge {
+    font-weight: bold;
+    font-size: 0.75rem;
+    padding: 2px 8px;
+    border-radius: 9999px;
+    color: white;
+}
+.badge-rpm { background-color: #34495e; }
+.badge-deb { background-color: #c0392b; }
+.badge-flatpak { background-color: #2980b9; }
+.badge-appimage { background-color: #27ae60; }
+.badge-tarball { background-color: #d35400; }
+.badge-zip { background-color: #8e44ad; }
+.badge-unknown { background-color: #7f8c8d; }
+""")
+    Gtk.StyleContext.add_provider_for_display(
+        Gdk.Display.get_default(),
+        _APP_CSS_PROVIDER,
+        Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+    )
+
+
 class InstallerWindow(Adw.ApplicationWindow):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -1260,37 +1302,8 @@ class InstallerWindow(Adw.ApplicationWindow):
         content.append(log_frame)
 
         # ── CSS ───────────────────────────────────────────────────────────────
-        css = Gtk.CssProvider()
-        css.load_from_data(b"""
-.drop-area {
-    border-radius: 16px;
-    border: 2px dashed alpha(@accent_color, 0.4);
-    background: alpha(@accent_color, 0.04);
-    padding: 24px;
-    transition: border-color 200ms, background 200ms;
-}
-.drop-area.drag-over {
-    border-color: @accent_color;
-    background: alpha(@accent_color, 0.10);
-}
-.badge {
-    font-weight: bold;
-    font-size: 0.75rem;
-    padding: 2px 8px;
-    border-radius: 9999px;
-    color: white;
-}
-.badge-rpm { background-color: #34495e; }
-.badge-deb { background-color: #c0392b; }
-.badge-flatpak { background-color: #2980b9; }
-.badge-appimage { background-color: #27ae60; }
-.badge-tarball { background-color: #d35400; }
-.badge-zip { background-color: #8e44ad; }
-.badge-unknown { background-color: #7f8c8d; }
-""")
-        Gtk.StyleContext.add_provider_for_display(
-            Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
-        )
+        # CSS is loaded once at module level — see _APP_CSS_PROVIDER below
+        _ensure_css_loaded()
 
         # ── window close: cancel any active install / search ─────────────────
         self.connect("close-request", self._on_close_request)
@@ -1321,12 +1334,15 @@ class InstallerWindow(Adw.ApplicationWindow):
 
     def _check_for_update(self):
         """Non-blocking background check — silently ignored on any failure."""
+        import weakref
+        win_ref = weakref.ref(self)
         try:
             req = urllib.request.Request(VERSION_URL, method="GET")
             with urllib.request.urlopen(req, timeout=5) as resp:
                 latest = resp.read().decode().strip()
-            if latest and latest != VERSION:
-                GLib.idle_add(self._show_update_banner, latest)
+            win = win_ref()
+            if win is not None and not win._closed and latest and latest != VERSION:
+                GLib.idle_add(win._show_update_banner, latest)
         except Exception:
             pass  # network down, timeout, 404 — all fine, just skip
 
@@ -1482,16 +1498,24 @@ class InstallerWindow(Adw.ApplicationWindow):
         return self._installing
 
     def _install_thread(self, path, app_name_override, sudo_password=None):
+        import weakref
+        win_ref = weakref.ref(self)
         try:
             install_file(path, app_name_override, self._log,
                          sudo_password=sudo_password,
                          cancel_token=self._cancel_token)
-            GLib.idle_add(self._install_done, True, None)
+            win = win_ref()
+            if win is not None:
+                GLib.idle_add(win._install_done, True, None)
         except CancelledError:
             self._cleanup_partial(path, app_name_override, sudo_password)
-            GLib.idle_add(self._install_cancelled)
+            win = win_ref()
+            if win is not None:
+                GLib.idle_add(win._install_cancelled)
         except Exception as e:
-            GLib.idle_add(self._install_done, False, str(e))
+            win = win_ref()
+            if win is not None:
+                GLib.idle_add(win._install_done, False, str(e))
         finally:
             sudo_password = None
 
