@@ -2113,15 +2113,29 @@ class InstallerWindow(Adw.ApplicationWindow):
         dlg.present()
 
     def _on_tab_changed(self, tab_view, _param):
-        """Persist the currently active tab index to config.json."""
+        """Persist the currently active tab index to config.json.
+        
+        notify::selected-page fires on every internal GTK property update,
+        not just user interaction. We debounce with a cached index to avoid
+        hammering load_config/save_config in a tight loop.
+        """
         pages = tab_view.get_pages()
         selected = tab_view.get_selected_page()
         for i in range(pages.get_n_items()):
             if pages.get_item(i) == selected:
-                cfg = load_config()
-                cfg["last_tab"] = i
-                save_config(cfg)
+                # Only write if the tab actually changed
+                if getattr(self, "_last_saved_tab", None) == i:
+                    return
+                self._last_saved_tab = i
+                # Defer the write off the GTK main loop
+                GLib.idle_add(self._save_tab_config, i)
                 break
+
+    def _save_tab_config(self, index: int):
+        cfg = load_config()
+        cfg["last_tab"] = index
+        save_config(cfg)
+        return False
 
 
 
