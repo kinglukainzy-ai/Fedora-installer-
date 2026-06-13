@@ -38,6 +38,7 @@ import shutil
 import tempfile
 from datetime import datetime
 import gc
+import queue as _queue
 
 APP_ID = "io.github.kinglukainzy_ai.FedoraInstaller"
 VERSION_FILE = "/usr/local/lib/fedora-installer/VERSION"
@@ -51,42 +52,192 @@ VERSION_URL = (
     "https://raw.githubusercontent.com/kinglukainzy-ai/Fedora-installer-/main/VERSION"
 )
 
+# ── Bounded log sink ──────────────────────────────────────────────────────────
+# ROOT CAUSE OF 5 GB RAM SPIKE:
+# The old design called GLib.idle_add(_append) once per log line. Install
+# threads can produce thousands of lines per second (dnf, flatpak). Each call
+# allocates a closure object that holds the line string and sits in GLib's idle
+# queue until the GTK main loop gets to drain it. When the main loop is busy
+# (e.g. updating widgets), the queue grows without bound — thousands of live
+# closure objects each holding a heap string. The TextBuffer also grew without
+# any trimming, so every character was retained in memory for the lifetime of
+# the process.
+#
+# Fix: BoundedLogSink decouples the producer (install thread) from the
+# consumer (GTK main loop) with a bounded queue:
+#   • The install thread pushes lines into a thread-safe deque (at most
+#     MAX_QUEUED_LINES entries; older entries are silently dropped).
+#   • A single GLib.timeout_add(50 ms) timer drains the deque in a batch
+#     on the main thread — one GTK round-trip per 50 ms instead of one per line.
+#   • The TextBuffer is capped at MAX_BUFFER_LINES: when inserting would exceed
+#     the cap, the oldest lines are deleted first (O(lines_to_drop) gtk ops).
+#   • The timer is self-cancelling when the sink is closed.
 
-def _log_output(text: str, log, max_lines: int = 20):
-    """Log subprocess output, collapsing excessive lines into a summary."""
-    lines = text.strip().splitlines()
-    if len(lines) > max_lines:
-        for l in lines[:max_lines]:
-            log(l)
-        log(f"… ({len(lines) - max_lines} more lines suppressed)")
-    else:
-        for l in lines:
-            log(l)
+_MAX_QUEUED_LINES = 500    # max pending lines in the thread→GTK queue
+_MAX_BUFFER_LINES = 500    # max lines kept in the visible TextBuffer
+
+
+class BoundedLogSink:
+    """Thread-safe, memory-bounded log sink for GTK TextBuffer.
+
+    Call push(text) from any thread.  A GLib timer drains the queue on the
+    main thread in batches, keeping the TextBuffer at most _MAX_BUFFER_LINES
+    lines long.  Call close() when the operation is done to stop the timer.
+    """
+
+    def __init__(self, buf: "Gtk.TextBuffer", adj: "Gtk.Adjustment"):
+        self._buf = buf
+        self._adj = adj
+        self._q: "_queue.SimpleQueue[str | None]" = _queue.SimpleQueue()
+        self._closed = False
+        self._timer_id = GLib.timeout_add(50, self._drain)
+
+    def push(self, text: str) -> None:
+        """Enqueue a log line from any thread (non-blocking, drops if full)."""
+        if self._closed:
+            return
+        # SimpleQueue is unbounded by default; enforce the cap ourselves by
+        # checking approximate size. qsize() is O(1) on SimpleQueue.
+        try:
+            if self._q.qsize() < _MAX_QUEUED_LINES:
+                self._q.put_nowait(text.strip())
+            # else: silently drop — the UI would freeze trying to render
+            # thousands of lines anyway
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        """Stop draining. Safe to call multiple times."""
+        self._closed = True
+        if self._timer_id is not None:
+            GLib.source_remove(self._timer_id)
+            self._timer_id = None
+
+    def _drain(self) -> bool:
+        """Called on the GTK main thread every 50 ms."""
+        if self._closed:
+            self._timer_id = None
+            return False  # cancel the timer
+
+        buf = self._buf
+        adj = self._adj
+
+        # Drain up to 100 lines per tick to keep the UI responsive
+        lines_written = 0
+        while lines_written < 100:
+            try:
+                line = self._q.get_nowait()
+            except _queue.Empty:
+                break
+            end = buf.get_end_iter()
+            buf.insert(end, line + "\n")
+            lines_written += 1
+
+        if lines_written:
+            # Trim the buffer if it exceeds the cap
+            n = buf.get_line_count()
+            if n > _MAX_BUFFER_LINES:
+                drop = n - _MAX_BUFFER_LINES
+                start = buf.get_start_iter()
+                cut = buf.get_iter_at_line(drop)
+                buf.delete(start, cut)
+
+            # Scroll to the bottom
+            adj.set_value(adj.get_upper())
+
+        return True  # keep the timer alive
+
+
+def _append_capped(buf: bytearray, chunk: bytes, cap: int) -> None:
+    """Append bytes while keeping only the first cap bytes."""
+    if len(buf) >= cap:
+        return
+    remaining = cap - len(buf)
+    buf.extend(chunk[:remaining])
+
+
+def _stream_pipe(pipe, log=None, *, max_lines: int = 200,
+                 capture: bytearray | None = None,
+                 capture_limit: int = 64 * 1024,
+                 cancel_token=None) -> tuple[int, int]:
+    """Drain one subprocess pipe.
+
+    Returns (logged_lines, suppressed_lines).  If capture is provided, only the
+    first capture_limit bytes are retained while the rest is still drained.
+    """
+    logged = 0
+    suppressed = 0
+    for raw_line in iter(pipe.readline, b""):
+        if cancel_token and cancel_token.cancelled:
+            break
+        if capture is not None:
+            _append_capped(capture, raw_line, capture_limit)
+        if log is None:
+            continue
+        if logged < max_lines:
+            log(raw_line.decode(errors="replace").rstrip("\n"))
+            logged += 1
+        else:
+            suppressed += 1
+    return logged, suppressed
 
 
 def _stream_output(proc, log, cancel_token=None, max_lines: int = 200):
-    """Stream subprocess stdout line-by-line, logging each line.
+    """Stream subprocess stdout/stderr concurrently with bounded memory use."""
+    stderr_buf = bytearray()
+    results: dict[str, tuple[int, int]] = {}
 
-    Reads directly from the pipe — no full buffer is ever held in RAM.
-    Stops early if cancel_token is set.  Suppresses output after max_lines
-    and reports how many lines were hidden.
-    """
-    count = 0
-    suppressed = 0
-    for raw_line in proc.stdout:
-        if cancel_token and cancel_token.cancelled:
-            break
-        line = raw_line.decode(errors="replace").rstrip("\n")
-        count += 1
-        if count <= max_lines:
-            log(line)
-        else:
-            suppressed += 1
+    def _drain_stdout():
+        results["stdout"] = _stream_pipe(
+            proc.stdout, log, max_lines=max_lines, cancel_token=cancel_token
+        )
+
+    def _drain_stderr():
+        results["stderr"] = _stream_pipe(
+            proc.stderr, log, max_lines=max_lines, capture=stderr_buf,
+            cancel_token=cancel_token
+        )
+
+    threads = [
+        threading.Thread(target=_drain_stdout, daemon=True),
+        threading.Thread(target=_drain_stderr, daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    suppressed = sum(item[1] for item in results.values())
     if suppressed:
         log(f"… ({suppressed} more lines suppressed)")
-    # Drain stderr (capped) so the pipe doesn't block
-    stderr_bytes = proc.stderr.read(64 * 1024)  # cap at 64 KB
-    return stderr_bytes.decode(errors="replace") if stderr_bytes else ""
+    return stderr_buf.decode(errors="replace")
+
+
+def _capture_capped_output(proc, capture_limit: int = 64 * 1024):
+    """Drain stdout/stderr concurrently and retain only capped output bytes."""
+    stdout_buf = bytearray()
+    stderr_buf = bytearray()
+
+    threads = [
+        threading.Thread(
+            target=_stream_pipe,
+            args=(proc.stdout,),
+            kwargs={"capture": stdout_buf, "capture_limit": capture_limit},
+            daemon=True,
+        ),
+        threading.Thread(
+            target=_stream_pipe,
+            args=(proc.stderr,),
+            kwargs={"capture": stderr_buf, "capture_limit": capture_limit},
+            daemon=True,
+        ),
+    ]
+    for thread in threads:
+        thread.start()
+    proc.wait()
+    for thread in threads:
+        thread.join()
+    return bytes(stdout_buf), bytes(stderr_buf)
 
 
 class CancelledError(Exception):
@@ -141,9 +292,9 @@ def cancellable_run(cmd: list[str], token: CancelToken | None = None,
     """Run a subprocess, killing it if the token is cancelled.
 
     Uses Popen internally so the process can be terminated mid-flight.
-    If *log* is provided, stdout is streamed line-by-line through
-    _stream_output (never buffered fully in RAM).  When log is None,
-    falls back to communicate() for callers that need the bytes.
+    If *log* is provided, stdout/stderr are streamed line-by-line through
+    _stream_output.  When log is None, stdout/stderr are still drained
+    concurrently but captured output is capped.
     Returns a CompletedProcess-like object.
     """
     if token:
@@ -158,7 +309,7 @@ def cancellable_run(cmd: list[str], token: CancelToken | None = None,
             stdout = b""
             stderr = stderr_str.encode(errors="replace")
         else:
-            stdout, stderr = proc.communicate()
+            stdout, stderr = _capture_capped_output(proc)
     finally:
         if token:
             token.unregister()
@@ -318,7 +469,16 @@ def send_notification(summary: str, body: str = "", urgency: str = "normal") -> 
         ]
         if body:
             cmd.append(body)
-        subprocess.Popen(cmd, close_fds=True)
+        # Fix Bug 10: Popen without wait() leaves a zombie process entry in the
+        # process table for each notification. Use subprocess.run with a short
+        # timeout inside a daemon thread so the UI never blocks.
+        def _fire():
+            try:
+                subprocess.run(cmd, close_fds=True, timeout=5,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+        threading.Thread(target=_fire, daemon=True).start()
     except Exception:
         pass  # notify-send not available — silently skip
 
@@ -391,8 +551,7 @@ def install_file(path: str, app_name_override: str | None, log,
                     proc.wait()
                     return subprocess.CompletedProcess(full_cmd, proc.returncode, b"", stderr_str.encode(errors="replace"))
                 else:
-                    stdout, stderr = proc.stdout.read(64 * 1024), proc.stderr.read(64 * 1024)
-                    proc.wait()
+                    stdout, stderr = _capture_capped_output(proc)
                     return subprocess.CompletedProcess(full_cmd, proc.returncode, stdout, stderr)
             finally:
                 if cancel_token:
@@ -730,8 +889,7 @@ def uninstall_app(app_name: str, install_type: str, paths: dict, package_name: s
                     proc.wait()
                     return subprocess.CompletedProcess(full_cmd, proc.returncode, b"", stderr_str.encode(errors="replace"))
                 else:
-                    stdout, stderr = proc.stdout.read(64 * 1024), proc.stderr.read(64 * 1024)
-                    proc.wait()
+                    stdout, stderr = _capture_capped_output(proc)
                     return subprocess.CompletedProcess(full_cmd, proc.returncode, stdout, stderr)
             finally:
                 if cancel_token:
@@ -861,8 +1019,12 @@ class UninstallDialog(Adw.AlertDialog):
         self.log_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
         self.log_buffer = self.log_view.get_buffer()
         log_scroll.set_child(self.log_view)
+        self._log_adj = log_scroll.get_vadjustment()  # Fix: was never assigned — caused AttributeError in _log
         box.append(log_scroll)
-        
+
+        # Use BoundedLogSink to prevent unbounded RAM growth from log output
+        self._log_sink = BoundedLogSink(self.log_buffer, self._log_adj)
+
         self.set_extra_child(box)
         
         # Responses
@@ -880,17 +1042,7 @@ class UninstallDialog(Adw.AlertDialog):
         threading.Thread(target=self._run_uninstall, args=(sudo_password,), daemon=True).start()
 
     def _log(self, text: str):
-        buf = self.log_buffer
-        adj = self._log_adj
-        closed = self
-        def _append():
-            if closed._closed:
-                return False
-            end = buf.get_end_iter()
-            buf.insert(end, text.strip() + "\n")
-            adj.set_value(adj.get_upper())
-            return False
-        GLib.idle_add(_append)
+        self._log_sink.push(text)
 
     def _pulse(self):
         if self.uninstalling:
@@ -953,6 +1105,7 @@ class UninstallDialog(Adw.AlertDialog):
             self.cancel_token.cancel()
         else:
             self._closed = True
+            self._log_sink.close()
             self.destroy()
 
 
@@ -981,8 +1134,12 @@ class UpdateDialog(Adw.AlertDialog):
         self.log_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
         self.log_buffer = self.log_view.get_buffer()
         log_scroll.set_child(self.log_view)
+        self._log_adj = log_scroll.get_vadjustment()  # Fix: was never assigned — caused AttributeError in _log
         box.append(log_scroll)
-        
+
+        # Use BoundedLogSink to prevent unbounded RAM growth from log output
+        self._log_sink = BoundedLogSink(self.log_buffer, self._log_adj)
+
         self.set_extra_child(box)
         
         # Responses
@@ -1001,17 +1158,7 @@ class UpdateDialog(Adw.AlertDialog):
         threading.Thread(target=self._run_update, args=(sudo_password,), daemon=True).start()
 
     def _log(self, text: str):
-        buf = self.log_buffer
-        adj = self._log_adj
-        closed = self
-        def _append():
-            if closed._closed:
-                return False
-            end = buf.get_end_iter()
-            buf.insert(end, text.strip() + "\n")
-            adj.set_value(adj.get_upper())
-            return False
-        GLib.idle_add(_append)
+        self._log_sink.push(text)
 
     def _pulse(self):
         if self.updating:
@@ -1030,25 +1177,19 @@ class UpdateDialog(Adw.AlertDialog):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE
             )
-            
-            # Pipe password if provided
+
+            # Fix: stdin MUST be closed after writing the password.
+            # sudo -S reads credentials from stdin and then keeps reading,
+            # blocking indefinitely if the pipe stays open — the subprocess
+            # never actually runs and the readline() loop hangs forever.
             if sudo_password:
                 proc.stdin.write((sudo_password + "\n").encode())
-                proc.stdin.flush()
-            
-            # Read stdout line by line
-            while True:
-                line = proc.stdout.readline()
-                if not line:
-                    break
-                self._log(line.decode(errors="replace"))
-                
-            # Read stderr line by line
-            for raw_line in proc.stderr:
-                self._log(raw_line.decode(errors="replace"))
-                
+            proc.stdin.flush()
+            proc.stdin.close()  # signals EOF to sudo
+
+            _stream_output(proc, self._log)
             proc.wait()
-            
+
             if proc.returncode == 0:
                 GLib.idle_add(self._done, True, None)
             else:
@@ -1080,12 +1221,14 @@ class UpdateDialog(Adw.AlertDialog):
 
     def _on_response(self, dialog, response_id):
         if response_id == "restart":
+            self._log_sink.close()
             try:
                 os.execv(sys.executable, [sys.executable] + sys.argv)
             except Exception:
                 sys.exit(0)
         else:
             self._closed = True
+            self._log_sink.close()
             self.destroy()
 
 
@@ -1308,6 +1451,9 @@ class InstallerWindow(Adw.ApplicationWindow):
         content.append(log_frame)
         self._log_scroll_adj = log_scroll.get_vadjustment()  # cached — avoids get_parent() in _log
 
+        # Use BoundedLogSink to prevent unbounded RAM growth from log output
+        self._log_sink = BoundedLogSink(self.log_buffer, self._log_scroll_adj)
+
         # ── CSS ───────────────────────────────────────────────────────────────
         # CSS is loaded once at module level — see _APP_CSS_PROVIDER below
         _ensure_css_loaded()
@@ -1315,26 +1461,36 @@ class InstallerWindow(Adw.ApplicationWindow):
         # ── window close: cancel any active install / search ─────────────────
         self.connect("close-request", self._on_close_request)
 
-        # ── background update check ───────────────────────────────────────────
-        threading.Thread(target=self._check_for_update, daemon=True).start()
+        # NOTE: background update check is now started by FedoraInstallerApp.do_activate,
+        # not here, so it fires exactly once per process lifetime instead of once per window.
 
     # ── close-request ─────────────────────────────────────────────────────────
 
     def _on_close_request(self, window):
-        """Cancel any running install or search before the window is destroyed."""
+        """Cancel any running install or search before the window is destroyed,
+        then quit the application so the process actually exits."""
         self._closed = True
-        # Stop the search
+        # Stop the log sink timer before anything else so no more GTK widget
+        # access can happen from the drain callback after the window tears down
+        self._log_sink.close()
+        # Stop the search debounce timer so no new search threads are spawned
         self._search_cancel_event.set()
         if self._search_debounce_id is not None:
             GLib.source_remove(self._search_debounce_id)
             self._search_debounce_id = None
-        # Stop the install
+        # Stop the install subprocess
         if self._installing and self._cancel_token:
             self._cancel_token.cancel()
         # Stop pulse timer so it doesn't fire against a destroyed widget
         if self._pulse_id is not None:
             GLib.source_remove(self._pulse_id)
             self._pulse_id = None
+        # Quit the GLib main loop so the process exits cleanly.
+        # Without this, daemon threads and GLib sources can keep the process
+        # alive indefinitely after the window closes.
+        app = self.get_application()
+        if app is not None:
+            app.quit()
         return False  # allow the window to close
 
     # ── update check ──────────────────────────────────────────────────────────
@@ -1455,19 +1611,7 @@ class InstallerWindow(Adw.ApplicationWindow):
         self._log(f"Selected: {path}")
 
     def _log(self, text: str):
-        import weakref
-        buf = self.log_buffer          # direct ref to buffer — no tree walk
-        adj = self._log_scroll_adj     # cached on init — no get_parent() call
-        closed_ref = weakref.ref(self)
-        def _append():
-            win = closed_ref()
-            if win is None or win._closed:
-                return False
-            end = buf.get_end_iter()
-            buf.insert(end, text.strip() + "\n")
-            adj.set_value(adj.get_upper())
-            return False
-        GLib.idle_add(_append)
+        self._log_sink.push(text)
 
     # ── install ───────────────────────────────────────────────────────────────
 
@@ -1484,8 +1628,11 @@ class InstallerWindow(Adw.ApplicationWindow):
         sudo_password = self.pwd_entry.get_text().strip() or None
         self.pwd_entry.set_text("")
 
-        # Clear log buffer so output from previous installs doesn't accumulate
+        # Clear log buffer so output from previous installs doesn't accumulate.
+        # Also drain any leftover items in the sink queue from the previous run.
         self.log_buffer.set_text("")
+        self._log_sink.close()
+        self._log_sink = BoundedLogSink(self.log_buffer, self._log_scroll_adj)
 
         # pulse the progress bar on a timer
         self._pulse_id = GLib.timeout_add(100, self._pulse)
@@ -1505,6 +1652,11 @@ class InstallerWindow(Adw.ApplicationWindow):
             self._cancel_token.cancel()
 
     def _pulse(self):
+        # Fix Bug 8: guard against firing after window close; _closed is set
+        # in _on_close_request before the pulse timer is removed, so there is a
+        # small window where GLib fires this callback after _closed is True.
+        if self._closed:
+            return False
         self.progress.pulse()
         return self._installing
 
@@ -1574,6 +1726,8 @@ class InstallerWindow(Adw.ApplicationWindow):
 
         if success:
             self._log("Installation complete!")
+            # Let the sink drain the final message before closing it
+            GLib.timeout_add(200, self._log_sink.close)
             self.refresh_installed_tab()  # already on main thread via idle_add
             # Desktop notification — useful when the user switched windows
             app_name = (
@@ -1592,6 +1746,7 @@ class InstallerWindow(Adw.ApplicationWindow):
             dialog.present(self)
         else:
             self._log(f"❌ Error: {error}")
+            GLib.timeout_add(200, self._log_sink.close)
             send_notification(
                 "Installation failed",
                 str(error or "Unknown error"),
@@ -1620,6 +1775,7 @@ class InstallerWindow(Adw.ApplicationWindow):
         self.cancel_btn.set_visible(False)
         self.install_btn.set_sensitive(True)
         self._log("Installation cancelled.")
+        GLib.timeout_add(200, self._log_sink.close)
         send_notification(
             "Installation cancelled",
             "The installation was cancelled. Partial files may remain.",
@@ -1769,9 +1925,16 @@ class InstallerWindow(Adw.ApplicationWindow):
 
         def _fire():
             self._search_debounce_id = None
-            # Reset the cancel flag and launch exactly one search thread
-            self._search_cancel_event.clear()
-            threading.Thread(target=self._run_search, args=(query,), daemon=True).start()
+            # Fix Bug 9: _search_lock and _search_thread were declared in __init__
+            # but never used, leaving a race: the old thread could see the event
+            # cleared and post stale results to the UI right after _fire() cleared
+            # it. Now we hold the lock while clearing and replacing the thread ref
+            # so _run_search checks the lock before posting results.
+            with self._search_lock:
+                self._search_cancel_event.clear()
+                t = threading.Thread(target=self._run_search, args=(query,), daemon=True)
+                self._search_thread = t
+            t.start()
             return False  # one-shot timer
 
         self._search_debounce_id = GLib.timeout_add(300, _fire)
@@ -1827,7 +1990,7 @@ class InstallerWindow(Adw.ApplicationWindow):
             except Exception:
                 user_items = []
             p_user.wait()
-            
+
             for item in user_items:
                 if cancelled.is_set(): return
                 name = item.get("name", "")
@@ -1839,14 +2002,18 @@ class InstallerWindow(Adw.ApplicationWindow):
                             "package_name": app_id,
                             "install_type": "flatpak"
                         })
-            
+
+            # Fix Bug 7: p_sys was spawned before the cancel check, so if
+            # cancelled mid-iteration above it would return and leave p_sys
+            # running as a zombie. Now we check before spawning p_sys.
+            if cancelled.is_set(): return
             p_sys = subprocess.Popen(["flatpak", "list", "--app", "--system", "--json"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             try:
                 sys_items = json.load(p_sys.stdout)
             except Exception:
                 sys_items = []
             p_sys.wait()
-            
+
             for item in sys_items:
                 if cancelled.is_set(): return
                 name = item.get("name", "")
@@ -1898,8 +2065,12 @@ class InstallerWindow(Adw.ApplicationWindow):
         except Exception:
             pass
 
-        if not cancelled.is_set():
-            GLib.idle_add(self._update_search_results_ui, results)
+        # Fix Bug 9: hold the lock to check if we are still the current search
+        # thread before posting results, closing the race between _fire() clearing
+        # the event and this thread finishing.
+        with self._search_lock:
+            if not cancelled.is_set() and self._search_thread is threading.current_thread():
+                GLib.idle_add(self._update_search_results_ui, results)
 
     def _clear_search_results(self):
         for lst in (self.search_flatpak_list, self.search_appimage_list, self.search_manual_list, self.search_dnf_list):
@@ -2365,6 +2536,7 @@ class FedoraInstallerApp(Adw.Application):
         super().__init__(application_id=APP_ID)
         self.path_arg = None
         self._first_launch_shown = False
+        self._update_check_done = False  # Fix: prevent spawning a new update-check thread on every activation
 
     def do_activate(self):
         win = self.get_active_window()
@@ -2372,6 +2544,12 @@ class FedoraInstallerApp(Adw.Application):
             win = InstallerWindow(application=self)
             if self.path_arg:
                 win._set_file(self.path_arg)
+            # Fix: only start the background update check once, when the window is first created.
+            # Previously this was called inside InstallerWindow.__init__ via threading.Thread, which
+            # meant every do_activate (e.g. opening a file from Nautilus) spawned a new thread.
+            if not self._update_check_done:
+                self._update_check_done = True
+                threading.Thread(target=win._check_for_update, daemon=True).start()
         win.present()
         # Show first-launch dialog once per process lifetime (not on every
         # window raise / do_activate call).
