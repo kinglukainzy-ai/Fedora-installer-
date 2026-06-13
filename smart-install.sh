@@ -312,7 +312,7 @@ case "$TYPE" in
                 sudo dnf install -y alien
             fi
             local TMP_DIR
-            TMP_DIR=$(mktemp -d)
+            TMP_DIR=$(mktemp -d --tmpdir=/var/tmp)
             (cd "$TMP_DIR" && alien --to-rpm --scripts "$FILE")
             local rpm_files=("$TMP_DIR"/*.rpm)
             if [[ ! -e "${rpm_files[0]}" ]]; then
@@ -356,7 +356,7 @@ case "$TYPE" in
 
         # Try to extract icon from AppImage
         icon_path=""
-        TMP_DIR=$(mktemp -d)
+        TMP_DIR=$(mktemp -d --tmpdir=/var/tmp)
         # Execute --appimage-extract inside TMP_DIR to avoid junk files in CWD
         if (cd "$TMP_DIR" && "$DEST" --appimage-extract &>/dev/null); then
             raw_icon=$(find_icon "$TMP_DIR/squashfs-root")

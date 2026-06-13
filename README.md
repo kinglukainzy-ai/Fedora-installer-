@@ -1,6 +1,6 @@
 # Fedora Installer
 
-![Version](https://img.shields.io/badge/version-1.4.0-blue)
+![Version](https://img.shields.io/badge/version-1.9.1-blue)
 ![License](https://img.shields.io/badge/license-GPL--3.0-green)
 
 A universal **GUI + CLI** installer for Fedora/GNOME.
@@ -39,7 +39,7 @@ Drop any installer file — `.rpm`, `.deb`, `.flatpak`, `.AppImage`, tarball, or
 | File type | How it's installed |
 |---|---|
 | `.rpm` | `dnf install` |
-| `.deb` | Converted via `alien` → RPM → `dnf install` |
+| `.deb` | Installed via `distrobox` by default, with optional `alien` conversion |
 | `.flatpak` | `flatpak install --user` (user-level, no root needed) |
 | `.AppImage` | Copied to `~/.local/bin`, icon extracted, desktop entry created |
 | `.tar.gz` / `.tar.xz` / `.tar.bz2` / `.tar.zst` / `.tgz` / `.tar` | Extracted to `/opt/<appname>`, executable symlinked to `/usr/local/bin` |
@@ -103,8 +103,8 @@ chmod +x setup.sh
 
 The setup script:
 
-1. Installs all system dependencies (`python3-gobject`, `libadwaita`, `gtk4`, `flatpak`, `unzip`, `tar`, `libnotify`)
-2. Optionally installs `alien` for `.deb` support
+1. Installs all system dependencies (`python3-gobject`, `libadwaita`, `gtk4`, `flatpak`, `unzip`, `tar`, `curl`, `git`, `zenity`, `gnome-terminal`, `libnotify`)
+2. Optionally installs `distrobox` and `podman` for recommended `.deb` support
 3. Copies `fedora_installer.py` and `VERSION` to `/usr/local/lib/fedora-installer/`
 4. Creates a CLI launcher at `/usr/local/bin/fedora-installer` (with built-in `--update` and `--version` flags)
 5. Installs `smart-install.sh` to `~/.local/bin/`
@@ -183,7 +183,7 @@ If you're already up to date, it prints `✅ Already up to date` and exits.
 - **No shell injection** — all `subprocess` calls in the GUI use argument lists, never `bash -c` with interpolated strings
 - **Safe positional arguments** — the Nautilus script passes variables as positional args to `bash -c`, immune to single-quote injection
 - **App name sanitization** — whitespace in app names is normalized to hyphens, preventing broken paths in `/opt/` and `/usr/local/bin/`
-- **Temp directory isolation** — all archive extraction and `.deb` conversion happens in `mktemp -d` (CLI) or `tempfile.TemporaryDirectory()` (GUI), never polluting the working directory
+- **Temp directory isolation** — archive extraction and `.deb` conversion happen in isolated temp directories, using `/var/tmp` for large CLI/GUI extraction paths instead of RAM-backed `/tmp`
 - **Return-code checking** — all critical subprocess calls check exit codes and report failures
 - **Cleanup on failure** — the CLI script's `EXIT` trap removes temp directories even on unexpected exits
 
@@ -193,7 +193,9 @@ If you're already up to date, it prints `✅ Already up to date` and exits.
 
 - **Fedora 38+** with GNOME
 - **Python 3.11+**, GTK4, libadwaita, `python3-gobject`
-- `alien` — optional, for `.deb` → `.rpm` conversion
+- `distrobox` and `podman` — recommended for `.deb` support
+- `alien` — optional alternate `.deb` → `.rpm` conversion method
+- `curl` and `git` — for the built-in updater
 - `zenity` — for the Nautilus right-click dialog
 - `gnome-terminal` — for terminal output during Nautilus installs (falls back to inline execution)
 
@@ -240,9 +242,15 @@ This project is licensed under the **GNU General Public License v3.0** — see t
 
 ## Changelog
 
+### v1.9.1 (2026-06-13)
+
+- **Bounded subprocess output** — GUI installs, uninstalls, and updates now drain stdout and stderr concurrently while capping captured output, preventing noisy package tools from blocking or growing memory usage.
+- **Bounded GTK logging** — Install, uninstall, and update logs use a bounded GTK sink so repeated or verbose operations cannot grow the TextBuffer indefinitely.
+- **CLI temp-file consistency** — CLI `.deb` conversion and AppImage icon extraction now use `/var/tmp`, matching archive extraction and avoiding RAM-backed `/tmp` pressure.
+
 ### v1.4.0 (2026-06-10)
 
-- **Optimized Memory Usage & OOM Prevention** — Refactored command runners (`cancellable_run` and `sudo_run`) to stream stdout and stderr line-by-line using a custom generator. Subprocess logs no longer load entire command outputs into RAM.
+- **Optimized Memory Usage & OOM Prevention** — Refactored command runners (`cancellable_run` and `sudo_run`) to reduce subprocess log buffering and avoid loading entire command outputs into RAM.
 - **Efficient Package Search** — Streamed live search results directly from `rpm -qa` using Popen pipelines with timer-based timeouts, keeping memory footprints low.
 - **Aggressive Garbage Collection** — Integrated explicit `gc.collect()` sweeps following installation completion, cancellation, uninstallation, and search updates to ensure GTK objects are promptly garbage collected.
 

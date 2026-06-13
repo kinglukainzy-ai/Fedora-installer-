@@ -18,6 +18,10 @@ sudo dnf install -y --skip-unavailable \
     flatpak \
     unzip \
     tar \
+    curl \
+    git \
+    zenity \
+    gnome-terminal \
     libnotify || true
 
 # distrobox for .deb support
@@ -29,7 +33,7 @@ fi
 if [[ ! "$ans" =~ ^[Nn]$ ]]; then
     sudo dnf install -y distrobox podman && echo "✔ distrobox installed"
 else
-    echo "  Skipped distrobox — .deb files won't be supported."
+    echo "  Skipped distrobox — default .deb support won't be available unless you choose alien."
 fi
 
 
