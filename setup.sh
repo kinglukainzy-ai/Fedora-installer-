@@ -49,7 +49,7 @@ sudo cp "$SCRIPT_DIR/VERSION" /usr/local/lib/fedora-installer/VERSION
 echo "▸ Creating CLI launcher at /usr/local/bin/fedora-installer…"
 sudo tee /usr/local/bin/fedora-installer > /dev/null << 'LAUNCHER'
 #!/usr/bin/env bash
-# Fedora Installer launcher — supports --update and --version flags
+# Fedora Installer launcher — supports --update, --force-update, and --version flags
 set -euo pipefail
 
 INSTALL_DIR="/usr/local/lib/fedora-installer"
@@ -62,12 +62,16 @@ if [[ "${1:-}" == "--version" ]]; then
     exit 0
 fi
 
-if [[ "${1:-}" == "--update" ]]; then
+if [[ "${1:-}" == "--update" || "${1:-}" == "--force-update" ]]; then
+    FORCE=0
+    if [[ "${1:-}" == "--force-update" || "${2:-}" == "--force" ]]; then
+        FORCE=1
+    fi
     CURRENT=$(cat "$INSTALL_DIR/VERSION" 2>/dev/null || echo "0.0.0")
     echo "Current version: $CURRENT"
     echo "Checking for updates…"
 
-    LATEST=$(curl -fsSL --connect-timeout 10 "$VERSION_URL" 2>/dev/null | tr -d '[:space:]') || {
+    LATEST=$(curl -fsSL --connect-timeout 10 -H 'Cache-Control: no-cache' "$VERSION_URL?ts=$(date +%s)" 2>/dev/null | tr -d '[:space:]') || {
         echo "❌ Could not reach GitHub. Check your internet connection."
         exit 1
     }
@@ -77,12 +81,20 @@ if [[ "${1:-}" == "--update" ]]; then
         exit 1
     fi
 
-    if [[ "$LATEST" == "$CURRENT" ]]; then
+    echo "Latest version:  $LATEST"
+
+    if [[ "$LATEST" == "$CURRENT" && "$FORCE" -eq 0 ]]; then
         echo "✅ Already up to date ($CURRENT)."
+        echo "   To reinstall from the latest main branch anyway, run:"
+        echo "   fedora-installer --force-update"
         exit 0
     fi
 
-    echo "Updating $CURRENT → $LATEST …"
+    if [[ "$FORCE" -eq 1 && "$LATEST" == "$CURRENT" ]]; then
+        echo "Force-updating from main branch at version $LATEST …"
+    else
+        echo "Updating $CURRENT → $LATEST …"
+    fi
     TMP=$(mktemp -d --tmpdir=/var/tmp)
     trap 'rm -rf "$TMP"' EXIT
 

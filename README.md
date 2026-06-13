@@ -106,7 +106,7 @@ The setup script:
 1. Installs all system dependencies (`python3-gobject`, `libadwaita`, `gtk4`, `flatpak`, `unzip`, `tar`, `curl`, `git`, `zenity`, `gnome-terminal`, `libnotify`)
 2. Optionally installs `distrobox` and `podman` for recommended `.deb` support
 3. Copies `fedora_installer.py` and `VERSION` to `/usr/local/lib/fedora-installer/`
-4. Creates a CLI launcher at `/usr/local/bin/fedora-installer` (with built-in `--update` and `--version` flags)
+4. Creates a CLI launcher at `/usr/local/bin/fedora-installer` (with built-in `--update`, `--force-update`, and `--version` flags)
 5. Installs `smart-install.sh` to `~/.local/bin/`
 6. Registers the `.desktop` entry and app icon
 7. Installs the Nautilus right-click script
@@ -173,6 +173,12 @@ This will:
 4. Clean up the temp directory automatically (even on failure, via an `EXIT` trap)
 
 If you're already up to date, it prints `✅ Already up to date` and exits.
+
+To reinstall from the latest `main` branch even when the remote `VERSION` still matches your installed version:
+
+```bash
+fedora-installer --force-update
+```
 
 > **Tip:** The GUI also checks automatically on startup. If an update is available, a non-intrusive banner appears at the top of the window — click "How to update" for instructions.
 
