@@ -73,6 +73,10 @@ VERSION_URL = (
 #     the cap, the oldest lines are deleted first (O(lines_to_drop) gtk ops).
 #   • The timer is self-cancelling when the sink is closed.
 
+# dnf can emit ~500-2000 lines/sec during dependency resolution.
+# At a 50ms drain interval, worst-case input is ~100 lines/tick.
+# 500 queued lines = ~5 seconds of buffering before drops occur —
+# enough for a slow main thread without unbounded growth.
 _MAX_QUEUED_LINES = 500    # max pending lines in the thread→GTK queue
 _MAX_BUFFER_LINES = 500    # max lines kept in the visible TextBuffer
 
@@ -88,7 +92,7 @@ class BoundedLogSink:
     def __init__(self, buf: "Gtk.TextBuffer", adj: "Gtk.Adjustment"):
         self._buf = buf
         self._adj = adj
-        self._q: "_queue.SimpleQueue[str | None]" = _queue.SimpleQueue()
+        self._q: "_queue.Queue[str | None]" = _queue.Queue(maxsize=_MAX_QUEUED_LINES)
         self._closed = False
         self._timer_id = GLib.timeout_add(50, self._drain)
 
@@ -96,22 +100,23 @@ class BoundedLogSink:
         """Enqueue a log line from any thread (non-blocking, drops if full)."""
         if self._closed:
             return
-        # SimpleQueue is unbounded by default; enforce the cap ourselves by
-        # checking approximate size. qsize() is O(1) on SimpleQueue.
+        # Use bounded queue and catch Full exception for thread safety
         try:
-            if self._q.qsize() < _MAX_QUEUED_LINES:
-                self._q.put_nowait(text.strip())
-            # else: silently drop — the UI would freeze trying to render
-            # thousands of lines anyway
+            self._q.put_nowait(text.strip())
+        except _queue.Full:
+            pass
         except Exception:
             pass
 
     def close(self) -> None:
         """Stop draining. Safe to call multiple times."""
         self._closed = True
-        if self._timer_id is not None:
-            GLib.source_remove(self._timer_id)
-            self._timer_id = None
+        def _close_timer():
+            if self._timer_id is not None:
+                GLib.source_remove(self._timer_id)
+                self._timer_id = None
+            return False
+        GLib.idle_add(_close_timer)
 
     def _drain(self) -> bool:
         """Called on the GTK main thread every 50 ms."""
@@ -234,9 +239,9 @@ def _capture_capped_output(proc, capture_limit: int = 64 * 1024):
     ]
     for thread in threads:
         thread.start()
-    proc.wait()
     for thread in threads:
         thread.join()
+    proc.wait()
     return bytes(stdout_buf), bytes(stderr_buf)
 
 
@@ -410,19 +415,24 @@ def find_executable(directory: str) -> str | None:
                 fname = f.lower()
                 
                 # 1. Name matching
+                # Weight +100 for exact basename match (strongest signal)
+                # Weight +50 for substring match
                 if fname in (app_base, app_base.replace("-", ""), app_base.replace("_", "")):
                     score += 100
                 elif app_base in fname:
                     score += 50
                 
                 # 2. Location
+                # Executables in a bin/ directory are heavily favored
                 if "bin" in root.split(os.sep):
                     score += 30
                 
                 # 3. Depth penalty
+                # Shallower files are more likely to be the main entrypoint
                 score -= depth * 2
                 
                 # 4. Prefer binaries over shell script wrappers
+                # Shell wrappers often just point to the binary, which might be in a different dir
                 if not fname.endswith(".sh"):
                     score += 5
                 
@@ -509,30 +519,47 @@ def write_receipt(app_name: str, install_type: str, paths: dict, package_name: s
         json.dump(receipt, f, indent=2)
 
 
-def install_file(path: str, app_name_override: str | None, log,
-                 sudo_password: str | None = None,
-                 cancel_token: CancelToken | None = None,
-                 deb_method: str | None = None):
-    """
-    Core installer. Calls log(str) for progress. Raises on fatal error.
-    sudo_password: if provided, piped into sudo -S.
-    cancel_token: if provided, checked between steps and used to kill subprocesses.
-    deb_method: "distrobox" or "alien". Falls back to saved config if None.
-    """
-    if deb_method is None:
-        deb_method = get_deb_method()
-    if deb_method not in ("distrobox", "alien"):
-        raise RuntimeError(f"Invalid .deb install method: {deb_method}")
-    ftype = detect_type(path)
-    app_name = app_name_override or app_name_from_path(path)
-    # Sanitize: replace whitespace with hyphens for safe filesystem paths
-    app_name = re.sub(r'\s+', '-', app_name)
-    log(f"File type detected: {ftype}")
-    log(f"App name: {app_name}")
+class InstallerBackend:
+    def __init__(self, deb_method: str | None = None):
+        from fedora_installer import get_deb_method
+        self.deb_method = deb_method or get_deb_method()
 
-    def sudo_run(cmd: list[str], stream=False, **kwargs):
-        """Run a command under sudo.  When stream=True, pipe output
-        through _stream_output so it never buffers fully in RAM."""
+    def install(self, path: str, app_name_override: str | None, log,
+                sudo_password: str | None = None,
+                cancel_token = None):
+        ftype = detect_type(path)
+        app_name = app_name_override or app_name_from_path(path)
+        app_name = re.sub(r'\s+', '-', app_name)
+        log(f"File type detected: {ftype}")
+        log(f"App name: {app_name}")
+
+        if ftype == "rpm":
+            self._install_rpm(path, app_name, log, sudo_password, cancel_token)
+        elif ftype == "deb":
+            self._install_deb(path, app_name, log, sudo_password, cancel_token)
+        elif ftype == "flatpak":
+            self._install_flatpak(path, app_name, log, sudo_password, cancel_token)
+        elif ftype == "appimage":
+            self._install_appimage(path, app_name, log, sudo_password, cancel_token)
+        elif ftype in ("tarball", "zip"):
+            self._install_archive(path, app_name, ftype, log, sudo_password, cancel_token)
+        else:
+            raise RuntimeError(
+                f"Unrecognised file type for: {os.path.basename(path)}\n"
+                "Supported: .rpm  .deb  .flatpak  .AppImage  .tar.*  .zip"
+            )
+
+        if cancel_token:
+            cancel_token.check()
+        subprocess.run(
+            ["update-desktop-database",
+             os.path.expanduser("~/.local/share/applications")],
+            capture_output=True,
+        )
+        log("Desktop database updated. On Wayland, log out and back in "
+            "for the launcher icon to appear.")
+
+    def _sudo_run(self, cmd: list[str], stream: bool, log, sudo_password: str | None, cancel_token, **kwargs):
         if cancel_token:
             cancel_token.check()
         if sudo_password:
@@ -544,7 +571,6 @@ def install_file(path: str, app_name_override: str | None, log,
             if cancel_token:
                 cancel_token.register(proc)
             try:
-                # Write the password, then stream
                 proc.stdin.write((sudo_password + "\n").encode())
                 proc.stdin.flush()
                 proc.stdin.close()
@@ -563,8 +589,7 @@ def install_file(path: str, app_name_override: str | None, log,
                 return cancellable_run(["sudo"] + cmd, token=cancel_token, log=log, **kwargs)
             return cancellable_run(["sudo"] + cmd, token=cancel_token, **kwargs)
 
-    # ── RPM ──────────────────────────────────────────────────────────────────
-    if ftype == "rpm":
+    def _install_rpm(self, path, app_name, log, sudo_password, cancel_token):
         log("Installing via dnf…")
         package_name = None
         try:
@@ -575,7 +600,7 @@ def install_file(path: str, app_name_override: str | None, log,
         except Exception as e:
             log(f"⚠️  Could not query RPM package name: {e}")
 
-        proc = sudo_run(["dnf", "install", "-y", path], stream=True)
+        proc = self._sudo_run(["dnf", "install", "-y", path], True, log, sudo_password, cancel_token)
         if proc.returncode != 0:
             raise RuntimeError(proc.stderr.decode(errors="replace"))
         if cancel_token:
@@ -583,8 +608,7 @@ def install_file(path: str, app_name_override: str | None, log,
         log("✅ RPM installed.")
         write_receipt(app_name, "rpm", {}, package_name)
 
-    # ── DEB ──────────────────────────────────────────────────────────────────
-    elif ftype == "deb":
+    def _install_deb(self, path, app_name, log, sudo_password, cancel_token):
         def _install_deb_distrobox():
             CONTAINER = "fedora-installer-debian"
             memory = os.environ.get("FEDORA_INSTALLER_DEB_MEMORY", "3g")
@@ -592,12 +616,12 @@ def install_file(path: str, app_name_override: str | None, log,
             log("▸ Installing .deb via distrobox…")
             if shutil.which("distrobox") is None:
                 log("▸ distrobox not found — installing…")
-                proc = sudo_run(["dnf", "install", "-y", "distrobox", "podman"], stream=True)
+                proc = self._sudo_run(["dnf", "install", "-y", "distrobox", "podman"], True, log, sudo_password, cancel_token)
                 if proc.returncode != 0:
                     raise RuntimeError("Failed to install distrobox.\n" + proc.stderr.decode(errors="replace"))
             elif shutil.which("podman") is None and shutil.which("docker") is None:
                 log("▸ podman not found — installing…")
-                proc = sudo_run(["dnf", "install", "-y", "podman"], stream=True)
+                proc = self._sudo_run(["dnf", "install", "-y", "podman"], True, log, sudo_password, cancel_token)
                 if proc.returncode != 0:
                     raise RuntimeError("Failed to install podman.\n" + proc.stderr.decode(errors="replace"))
             existing = subprocess.run(["distrobox", "list"], capture_output=True, text=True)
@@ -644,7 +668,7 @@ def install_file(path: str, app_name_override: str | None, log,
             log("▸ Installing .deb via alien…")
             if shutil.which("alien") is None:
                 log("▸ alien not found — installing…")
-                proc = sudo_run(["dnf", "install", "-y", "alien"], stream=True)
+                proc = self._sudo_run(["dnf", "install", "-y", "alien"], True, log, sudo_password, cancel_token)
                 if proc.returncode != 0:
                     raise RuntimeError("Failed to install alien.\n" + proc.stderr.decode(errors="replace"))
             with tempfile.TemporaryDirectory(dir="/var/tmp") as tmpdir:
@@ -656,13 +680,12 @@ def install_file(path: str, app_name_override: str | None, log,
                     raise RuntimeError("alien did not produce an .rpm file.")
                 rpm_path = os.path.join(tmpdir, rpm_files[0])
                 log(f"▸ Installing converted RPM: {rpm_path}")
-                proc = sudo_run(["dnf", "install", "-y", rpm_path], stream=True)
+                proc = self._sudo_run(["dnf", "install", "-y", rpm_path], True, log, sudo_password, cancel_token)
                 if proc.returncode != 0:
                     raise RuntimeError(proc.stderr.decode(errors="replace"))
             log("✅ .deb converted and installed via alien.")
 
-        # Use chosen method, with fallback to distrobox if alien fails
-        if deb_method == "alien":
+        if self.deb_method == "alien":
             try:
                 _install_deb_alien()
             except RuntimeError as alien_err:
@@ -671,17 +694,14 @@ def install_file(path: str, app_name_override: str | None, log,
                 _install_deb_distrobox()
         else:
             _install_deb_distrobox()
-
         write_receipt(app_name, "deb", {}, app_name)
 
-    # ── FLATPAK ───────────────────────────────────────────────────────────────
-    elif ftype == "flatpak":
+    def _install_flatpak(self, path, app_name, log, sudo_password, cancel_token):
         log("Installing Flatpak bundle…")
         proc = cancellable_run(
             ["flatpak", "install", "--user", "--noninteractive", path],
             token=cancel_token, log=log
         )
-        stdout_str = proc.stdout.decode(errors="replace")
         if proc.returncode != 0:
             raise RuntimeError(proc.stderr.decode(errors="replace"))
         if cancel_token:
@@ -689,24 +709,38 @@ def install_file(path: str, app_name_override: str | None, log,
 
         package_name = None
         try:
-            candidates = re.findall(r'\b[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)+\b', stdout_str)
-            filtered = [
-                c for c in candidates 
-                if not any(r in c for r in (".Platform", ".Sdk", ".Locale", ".BaseApp", ".BaseExtension"))
-            ]
-            if filtered:
-                package_name = filtered[-1]
+            result = subprocess.run(
+                ["flatpak", "list", "--app", "--json"],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                apps = json.loads(result.stdout)
+                for app in apps:
+                    if app_name.lower() in app.get("name", "").lower() or app_name.lower() in app.get("application_id", "").lower():
+                        package_name = app.get("application_id")
+                        break
+            
+            if not package_name:
+                candidates = re.findall(r'\b[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)+\b', proc.stdout.decode(errors="replace"))
+                filtered = [
+                    c for c in candidates 
+                    if not any(r in c for r in (".Platform", ".Sdk", ".Locale", ".BaseApp", ".BaseExtension"))
+                ]
+                if filtered:
+                    package_name = filtered[-1]
+
+            if package_name:
                 log(f"Detected Flatpak application ID: {package_name}")
             else:
-                log("⚠️  Could not detect Flatpak application ID from installation output.")
+                log("⚠️  Could not determine Flatpak ID — uninstall will require manual removal.")
         except Exception as e:
-            log(f"⚠️  Error parsing Flatpak ID: {e}")
+            log(f"⚠️  Error querying Flatpak ID: {e}")
+            log("⚠️  Could not determine Flatpak ID — uninstall will require manual removal.")
 
         log("✅ Flatpak installed.")
         write_receipt(app_name, "flatpak", {}, package_name)
 
-    # ── APPIMAGE ──────────────────────────────────────────────────────────────
-    elif ftype == "appimage":
+    def _install_appimage(self, path, app_name, log, sudo_password, cancel_token):
         dest_dir = os.path.expanduser("~/.local/bin")
         os.makedirs(dest_dir, exist_ok=True)
         dest = os.path.join(dest_dir, f"{app_name}.AppImage")
@@ -714,8 +748,6 @@ def install_file(path: str, app_name_override: str | None, log,
         os.chmod(dest, 0o755)
         log(f"Copied to {dest}")
 
-        # Fix #2: extract icon in a secure temp dir, not CWD
-        # Fix #3: detect actual icon extension (.png or .svg) dynamically
         icon_path = None
         with tempfile.TemporaryDirectory() as tmpdir:
             extract = cancellable_run(
@@ -727,7 +759,7 @@ def install_file(path: str, app_name_override: str | None, log,
                 squash = os.path.join(tmpdir, "squashfs-root")
                 raw_icon = find_icon(squash)
                 if raw_icon:
-                    ext = os.path.splitext(raw_icon)[1]  # preserves .svg or .png
+                    ext = os.path.splitext(raw_icon)[1]
                     icon_dest = os.path.join(
                         os.path.expanduser("~/.local/share/icons"),
                         f"{app_name}{ext}",
@@ -747,11 +779,8 @@ def install_file(path: str, app_name_override: str | None, log,
             "icon": icon_path
         })
 
-    # ── TARBALL / ZIP ─────────────────────────────────────────────────────────
-    elif ftype in ("tarball", "zip"):
+    def _install_archive(self, path, app_name, ftype, log, sudo_password, cancel_token):
         log("Extracting archive…")
-
-        # Pre-flight disk space check — catch full disks before starting
         archive_size = os.path.getsize(path)
         stat_tmp = os.statvfs("/var/tmp")
         stat_opt = os.statvfs("/opt")
@@ -765,10 +794,8 @@ def install_file(path: str, app_name_override: str | None, log,
                 f"/opt ({free_opt // (1024**2)} MB available)."
             )
 
-        # Extract to /var/tmp (real disk) instead of /tmp (tmpfs, RAM-limited)
         with tempfile.TemporaryDirectory(dir="/var/tmp") as tmpdir:
             if ftype == "tarball":
-                # Fix #8: use plain -xf — GNU tar auto-detects compression
                 proc = cancellable_run(
                     ["tar", "-xf", path, "-C", tmpdir],
                     token=cancel_token,
@@ -782,7 +809,6 @@ def install_file(path: str, app_name_override: str | None, log,
             if proc.returncode != 0:
                 raise RuntimeError(proc.stderr.decode(errors="replace")[:500] or "extraction failed")
 
-            # Fix #1: determine the real content root
             top_items = os.listdir(tmpdir)
             if len(top_items) == 1 and os.path.isdir(os.path.join(tmpdir, top_items[0])):
                 content_root = os.path.join(tmpdir, top_items[0])
@@ -791,24 +817,21 @@ def install_file(path: str, app_name_override: str | None, log,
 
             install_dir = f"/opt/{app_name}"
             log(f"Installing to {install_dir}…")
-            proc2 = sudo_run(["mkdir", "-p", install_dir])
+            proc2 = self._sudo_run(["mkdir", "-p", install_dir], False, log, sudo_password, cancel_token)
             if proc2.returncode != 0:
                 raise RuntimeError(f"Cannot create {install_dir}: {proc2.stderr.decode()}")
 
             if cancel_token:
                 cancel_token.check()
-            # copy content_root into install_dir
             copy_proc = cancellable_run(
                 ["cp", "-a", content_root + "/.", install_dir + "/"],
                 token=cancel_token,
             )
             if copy_proc.returncode != 0:
-                # fallback: try with sudo
-                copy_proc = sudo_run(["cp", "-a", content_root + "/.", install_dir + "/"])
+                copy_proc = self._sudo_run(["cp", "-a", content_root + "/.", install_dir + "/"], False, log, sudo_password, cancel_token)
                 if copy_proc.returncode != 0:
                     raise RuntimeError(copy_proc.stderr.decode(errors="replace") or "copy failed")
 
-        # look for bundled install.sh
         install_sh = os.path.join(install_dir, "install.sh")
         symlink_path = None
         desktop_path = None
@@ -822,14 +845,13 @@ def install_file(path: str, app_name_override: str | None, log,
             )
             if proc_sh.returncode != 0:
                 log(f"⚠️  install.sh exited with code {proc_sh.returncode}")
-                # Stderr is already logged by streaming; if there are other errors raise them
             else:
                 log("install.sh completed.")
         else:
             exe = find_executable(install_dir)
             if exe:
                 link = f"/usr/local/bin/{app_name}"
-                ln_proc = sudo_run(["ln", "-sf", exe, link])
+                ln_proc = self._sudo_run(["ln", "-sf", exe, link], False, log, sudo_password, cancel_token)
                 if ln_proc.returncode != 0:
                     log(f"⚠️  Symlink failed: {ln_proc.stderr.decode(errors='replace')}")
                 else:
@@ -849,22 +871,9 @@ def install_file(path: str, app_name_override: str | None, log,
             "icon": icon_path
         })
 
-    else:
-        raise RuntimeError(
-            f"Unrecognised file type for: {os.path.basename(path)}\n"
-            "Supported: .rpm  .deb  .flatpak  .AppImage  .tar.*  .zip"
-        )
-
-    # Refresh GNOME shell icon cache
-    if cancel_token:
-        cancel_token.check()
-    subprocess.run(
-        ["update-desktop-database",
-         os.path.expanduser("~/.local/share/applications")],
-        capture_output=True,
-    )
-    log("Desktop database updated. On Wayland, log out and back in "
-        "for the launcher icon to appear.")
+def install_file(*args, **kwargs):
+    backend = InstallerBackend()
+    backend.install(*args, **kwargs)
 
 
 # ─────────────────────────── GTK4 UI ─────────────────────────────────────────
@@ -1721,7 +1730,15 @@ class InstallerWindow(Adw.ApplicationWindow):
                 subprocess.run(["sudo"] + cmd, capture_output=True)
 
         if ftype in ("rpm", "deb"):
-            cleanup_sudo(["dnf", "remove", "-y", app_name])
+            package_name = app_name
+            if ftype == "rpm":
+                try:
+                    pkg_proc = subprocess.run(["rpm", "-qp", "--qf", "%{NAME}", path], capture_output=True, text=True)
+                    if pkg_proc.returncode == 0 and pkg_proc.stdout.strip():
+                        package_name = pkg_proc.stdout.strip()
+                except Exception:
+                    pass
+            cleanup_sudo(["dnf", "remove", "-y", package_name])
         elif ftype == "appimage":
             dest = os.path.expanduser(f"~/.local/bin/{app_name}.AppImage")
             try: os.remove(dest)
