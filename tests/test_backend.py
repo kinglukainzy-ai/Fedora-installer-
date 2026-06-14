@@ -2,6 +2,7 @@ import pytest
 import os
 import tempfile
 import threading
+import time
 from unittest.mock import patch, MagicMock
 
 from fedora_installer import (
@@ -111,9 +112,40 @@ def test_bounded_log_sink_concurrency():
     sink.close()
 
 
+def test_bounded_log_sink_drains_on_glib_main_loop():
+    gi = pytest.importorskip("gi")
+    gi.require_version('Gtk', '4.0')
+    from gi.repository import Gtk, GLib
+
+    Gtk.init()
+    buf = Gtk.TextBuffer()
+    adj = Gtk.Adjustment()
+    sink = BoundedLogSink(buf, adj)
+
+    try:
+        sink.push("first")
+        sink.push("second")
+
+        deadline = time.monotonic() + 1.0
+        context = GLib.MainContext.default()
+        while buf.get_line_count() <= 1 and time.monotonic() < deadline:
+            context.iteration(True)
+
+        start = buf.get_start_iter()
+        end = buf.get_end_iter()
+        assert buf.get_text(start, end, False) == "first\nsecond\n"
+    finally:
+        sink.close()
+
+
 def test_installer_backend_init():
     backend = InstallerBackend(deb_method="alien")
     assert backend.deb_method == "alien"
+
+
+def test_installer_backend_rejects_unknown_deb_method():
+    backend = InstallerBackend(deb_method="unknown")
+    assert backend.deb_method == "distrobox"
 
 
 @patch('fedora_installer.InstallerBackend._install_rpm')

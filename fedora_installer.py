@@ -87,6 +87,16 @@ class BoundedLogSink:
     Call push(text) from any thread.  A GLib timer drains the queue on the
     main thread in batches, keeping the TextBuffer at most _MAX_BUFFER_LINES
     lines long.  Call close() when the operation is done to stop the timer.
+
+    Representation invariants:
+    - _q is the only cross-thread handoff point; GTK widgets are touched only
+      from _drain() or close's idle callback on the main loop.
+    - _q never contains more than _MAX_QUEUED_LINES items because push() is
+      non-blocking and drops new lines when the queue is full.
+    - _timer_id is either a live GLib source id or None after the source has
+      been removed/cancelled.
+    - When _closed is true, new log lines are ignored and the timer must stop
+      on its next main-loop callback.
     """
 
     def __init__(self, buf: "Gtk.TextBuffer", adj: "Gtk.Adjustment"):
@@ -451,6 +461,7 @@ DEFAULTS = {
     "first_launch_done": False,
     "last_tab":          0,      # 0 = Install, 1 = Installed
 }
+DEB_METHODS = {"distrobox", "alien"}
 
 def load_config() -> dict:
     try:
@@ -520,9 +531,22 @@ def write_receipt(app_name: str, install_type: str, paths: dict, package_name: s
 
 
 class InstallerBackend:
+    """Dispatch and execute supported installer backends.
+
+    Representation invariants:
+    - deb_method is always one of the configured method strings used by
+      _install_deb(); callers may pass it explicitly for tests.
+    - Public install() receives a filesystem path and routes solely by
+      detect_type(path); private _install_* methods own format-specific work.
+    - Subprocess output is either streamed through the provided log callable or
+      captured with bounded buffers through cancellable_run().
+    - Root-requiring operations go through _sudo_run() so cancellation and
+      password piping remain consistent.
+    """
+
     def __init__(self, deb_method: str | None = None):
-        from fedora_installer import get_deb_method
-        self.deb_method = deb_method or get_deb_method()
+        method = deb_method or get_deb_method()
+        self.deb_method = method if method in DEB_METHODS else "distrobox"
 
     def install(self, path: str, app_name_override: str | None, log,
                 sudo_password: str | None = None,
