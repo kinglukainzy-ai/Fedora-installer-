@@ -2,17 +2,15 @@ import pytest
 import os
 import tempfile
 import threading
-import gi
-gi.require_version('Gtk', '4.0')
-gi.require_version('Adw', '1')
-from gi.repository import Gtk, GLib
+from unittest.mock import patch, MagicMock
 
 from fedora_installer import (
     app_name_from_path,
     detect_type,
     find_executable,
     BoundedLogSink,
-    _MAX_QUEUED_LINES
+    _MAX_QUEUED_LINES,
+    InstallerBackend
 )
 
 
@@ -21,6 +19,9 @@ def test_app_name_from_path():
     assert app_name_from_path("VLC-3.0.18-arm64.dmg") == "VLC" # dmg is not in known list but fallback works
     assert app_name_from_path("VLC-3.0.18-arm64.AppImage") == "VLC"
     assert app_name_from_path("app.tar.gz") == "app"
+    # Negative test: pure binary with no extension
+    assert app_name_from_path("simple-binary") == "simple-binary"
+    assert app_name_from_path("app") == "app"
 
 
 def test_app_name_collision():
@@ -34,6 +35,9 @@ def test_detect_type():
     assert detect_type("/downloads/pkg.tar.gz") == "tarball"
     assert detect_type("/downloads/pkg.TAR.GZ") == "tarball"
     assert detect_type("/downloads/pkg.tar.gz.bak") == "unknown"
+    # Negative test: genuinely unknown extension
+    assert detect_type("/downloads/pkg.exe") == "unknown"
+    assert detect_type("/downloads/pkg") == "unknown"
 
 
 def test_find_executable():
@@ -76,6 +80,10 @@ def test_find_executable():
 
 
 def test_bounded_log_sink_concurrency():
+    gi = pytest.importorskip("gi")
+    gi.require_version('Gtk', '4.0')
+    from gi.repository import Gtk, GLib
+
     Gtk.init()
     buf = Gtk.TextBuffer()
     adj = Gtk.Adjustment()
@@ -95,9 +103,32 @@ def test_bounded_log_sink_concurrency():
     for t in threads:
         t.join()
 
-    # The internal queue should have dropped messages gracefully if it exceeded _MAX_QUEUED_LINES
-    # But it shouldn't crash or exceed maxsize
+    # We cannot easily test the asynchronous _drain without spinning a GLib MainLoop,
+    # but we can verify the queue enforces bounds.
     assert sink._q.qsize() <= _MAX_QUEUED_LINES
 
     # Stop the timer so the test can exit
     sink.close()
+
+
+def test_installer_backend_init():
+    backend = InstallerBackend(deb_method="alien")
+    assert backend.deb_method == "alien"
+
+
+@patch('fedora_installer.InstallerBackend._install_rpm')
+def test_installer_backend_dispatch(mock_install_rpm):
+    backend = InstallerBackend()
+    # Mock log and cancel_token
+    log_mock = MagicMock()
+    token_mock = MagicMock()
+    
+    # Trigger dispatch for rpm
+    backend.install("test.rpm", "app_override", log_mock, "pass", token_mock)
+    
+    # Assert dispatch worked
+    mock_install_rpm.assert_called_once_with("test.rpm", "app_override", log_mock, "pass", token_mock)
+
+    # Assert raises on unknown
+    with pytest.raises(RuntimeError, match="Unrecognised file type"):
+        backend.install("test.unknown", None, log_mock)
