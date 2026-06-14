@@ -216,7 +216,6 @@ The setup script (`setup.sh`) installs all of these automatically.
 ├── smart-install.sh                                    # CLI installer (no GUI needed)
 ├── Smart Install                                       # Nautilus right-click script
 ├── setup.sh                                            # One-time setup / dependency installer
-├── install.sh                                          # Symbolic link to setup.sh (convenience entry point)
 ├── VERSION                                             # Semver string (e.g. 1.0.0) used by --update
 ├── io.github.kinglukainzy_ai.FedoraInstaller.desktop   # .desktop file with MIME types
 ├── fedora-installer.png                                # App icon
