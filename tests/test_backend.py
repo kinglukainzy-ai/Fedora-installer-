@@ -11,7 +11,8 @@ from fedora_installer import (
     find_executable,
     BoundedLogSink,
     _MAX_QUEUED_LINES,
-    InstallerBackend
+    InstallerBackend,
+    write_receipt
 )
 
 
@@ -146,6 +147,19 @@ def test_installer_backend_init():
 def test_installer_backend_rejects_unknown_deb_method():
     backend = InstallerBackend(deb_method="unknown")
     assert backend.deb_method == "distrobox"
+
+
+def test_write_receipt_failure_is_nonfatal(tmp_path):
+    log_mock = MagicMock()
+
+    with patch("fedora_installer.os.path.expanduser", return_value=str(tmp_path)), \
+         patch("builtins.open", side_effect=OSError("disk full")):
+        result = write_receipt("app", "rpm", {}, "pkg", log_mock)
+
+    assert result is False
+    log_mock.assert_called_once()
+    assert "Could not write receipt" in log_mock.call_args.args[0]
+    assert "uninstall tracking unavailable" in log_mock.call_args.args[0]
 
 
 @patch('fedora_installer.InstallerBackend._install_rpm')

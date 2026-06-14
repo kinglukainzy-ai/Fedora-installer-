@@ -509,25 +509,32 @@ def get_deb_method() -> str:
     return load_config().get("deb_method") or "distrobox"
 
 
-def write_receipt(app_name: str, install_type: str, paths: dict, package_name: str | None = None):
-    """Write a JSON receipt of the installation to ~/.local/share/fedora-installer/receipts/"""
-    receipts_dir = os.path.expanduser("~/.local/share/fedora-installer/receipts")
-    os.makedirs(receipts_dir, exist_ok=True)
-    receipt = {
-        "app_name": app_name,
-        "install_type": install_type,
-        "installed_at": datetime.now().isoformat(),
-        "paths": {
-            "install_dir": paths.get("install_dir"),
-            "symlink": paths.get("symlink"),
-            "desktop_entry": paths.get("desktop_entry"),
-            "icon": paths.get("icon")
-        },
-        "package_name": package_name
-    }
-    receipt_file = os.path.join(receipts_dir, f"{app_name.lower().replace(' ', '-')}.json")
-    with open(receipt_file, "w") as f:
-        json.dump(receipt, f, indent=2)
+def write_receipt(app_name: str, install_type: str, paths: dict,
+                  package_name: str | None = None, log=None) -> bool:
+    """Write an install receipt; return False if tracking is unavailable."""
+    try:
+        receipts_dir = os.path.expanduser("~/.local/share/fedora-installer/receipts")
+        os.makedirs(receipts_dir, exist_ok=True)
+        receipt = {
+            "app_name": app_name,
+            "install_type": install_type,
+            "installed_at": datetime.now().isoformat(),
+            "paths": {
+                "install_dir": paths.get("install_dir"),
+                "symlink": paths.get("symlink"),
+                "desktop_entry": paths.get("desktop_entry"),
+                "icon": paths.get("icon")
+            },
+            "package_name": package_name
+        }
+        receipt_file = os.path.join(receipts_dir, f"{app_name.lower().replace(' ', '-')}.json")
+        with open(receipt_file, "w") as f:
+            json.dump(receipt, f, indent=2)
+        return True
+    except Exception as e:
+        if log is not None:
+            log(f"⚠️  Could not write receipt: {e} — uninstall tracking unavailable")
+        return False
 
 
 class InstallerBackend:
@@ -630,7 +637,7 @@ class InstallerBackend:
         if cancel_token:
             cancel_token.check()
         log("✅ RPM installed.")
-        write_receipt(app_name, "rpm", {}, package_name)
+        write_receipt(app_name, "rpm", {}, package_name, log)
 
     def _install_deb(self, path, app_name, log, sudo_password, cancel_token):
         def _install_deb_distrobox():
@@ -718,7 +725,7 @@ class InstallerBackend:
                 _install_deb_distrobox()
         else:
             _install_deb_distrobox()
-        write_receipt(app_name, "deb", {}, app_name)
+        write_receipt(app_name, "deb", {}, app_name, log)
 
     def _install_flatpak(self, path, app_name, log, sudo_password, cancel_token):
         log("Installing Flatpak bundle…")
@@ -762,7 +769,7 @@ class InstallerBackend:
             log("⚠️  Could not determine Flatpak ID — uninstall will require manual removal.")
 
         log("✅ Flatpak installed.")
-        write_receipt(app_name, "flatpak", {}, package_name)
+        write_receipt(app_name, "flatpak", {}, package_name, log)
 
     def _install_appimage(self, path, app_name, log, sudo_password, cancel_token):
         dest_dir = os.path.expanduser("~/.local/bin")
@@ -801,7 +808,7 @@ class InstallerBackend:
             "install_dir": dest,
             "desktop_entry": desktop_path,
             "icon": icon_path
-        })
+        }, log=log)
 
     def _install_archive(self, path, app_name, ftype, log, sudo_password, cancel_token):
         log("Extracting archive…")
@@ -893,7 +900,7 @@ class InstallerBackend:
             "symlink": symlink_path,
             "desktop_entry": desktop_path,
             "icon": icon_path
-        })
+        }, log=log)
 
 def install_file(*args, **kwargs):
     backend = InstallerBackend()
