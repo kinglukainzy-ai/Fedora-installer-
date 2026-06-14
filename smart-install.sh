@@ -24,23 +24,39 @@
 set -euo pipefail
 
 FILE="${1:-}"
-APP_NAME_OVERRIDE="${2:-}"
+APP_NAME_OVERRIDE=""
 DEB_METHOD=""
 
-# Parse --deb-method flag (can appear anywhere after the file)
-for arg in "$@"; do
+# Parse optional args after the file. Supports:
+#   smart-install.sh file.deb app-name --deb-method alien
+#   smart-install.sh file.deb --deb-method=alien
+args=("$@")
+i=1
+while (( i < ${#args[@]} )); do
+    arg="${args[$i]}"
     case "$arg" in
-        --deb-method=*) DEB_METHOD="${arg#*=}" ;;
-        --deb-method)   : ;;  # value handled below
+        --deb-method=*)
+            DEB_METHOD="${arg#*=}"
+            ;;
+        --deb-method)
+            i=$((i + 1))
+            DEB_METHOD="${args[$i]:-}"
+            ;;
+        --*)
+            echo "Unknown option: $arg"
+            exit 1
+            ;;
+        *)
+            if [[ -z "$APP_NAME_OVERRIDE" ]]; then
+                APP_NAME_OVERRIDE="$arg"
+            else
+                echo "Unexpected argument: $arg"
+                exit 1
+            fi
+            ;;
     esac
+    i=$((i + 1))
 done
-# Handle "--deb-method alien" (space-separated)
-for i in "${!@}"; do
-    if [[ "${!i}" == "--deb-method" ]]; then
-        next=$((i+1))
-        DEB_METHOD="${!next:-}"
-    fi
-done 2>/dev/null || true
 
 # Fall back to saved config if no flag
 if [[ -z "$DEB_METHOD" ]]; then
@@ -61,6 +77,16 @@ if [[ ! -f "$FILE" ]]; then
     echo "File not found: $FILE"
     exit 1
 fi
+FILE="$(readlink -f "$FILE")"
+
+case "$DEB_METHOD" in
+    distrobox|alien) ;;
+    *)
+        echo "Invalid --deb-method: $DEB_METHOD"
+        echo "Expected: distrobox or alien"
+        exit 1
+        ;;
+esac
 
 BASENAME="$(basename "$FILE")"
 LOWER="${BASENAME,,}"
@@ -280,6 +306,8 @@ case "$TYPE" in
     deb)
         install_deb_distrobox() {
             echo "▸ Installing .deb via distrobox…"
+            local DEB_CONTAINER_MEMORY="${FEDORA_INSTALLER_DEB_MEMORY:-3g}"
+            local DEB_CONTAINER_MEMORY_SWAP="${FEDORA_INSTALLER_DEB_MEMORY_SWAP:-5g}"
             if ! command -v distrobox &>/dev/null; then
                 echo "▸ distrobox not found — installing…"
                 sudo dnf install -y distrobox podman
@@ -291,17 +319,34 @@ case "$TYPE" in
             if ! distrobox list 2>/dev/null | grep -q "$CONTAINER_NAME"; then
                 echo "▸ Creating Debian container '$CONTAINER_NAME' (first time only)…"
                 distrobox create --name "$CONTAINER_NAME" \
-                    --image quay.io/toolbx-images/debian-toolbox:testing --yes
+                    --image quay.io/toolbx-images/debian-toolbox:testing \
+                    --additional-flags "--memory=$DEB_CONTAINER_MEMORY --memory-swap=$DEB_CONTAINER_MEMORY_SWAP" \
+                    --yes
+            elif command -v podman &>/dev/null; then
+                podman update \
+                    --memory="$DEB_CONTAINER_MEMORY" \
+                    --memory-swap="$DEB_CONTAINER_MEMORY_SWAP" \
+                    "$CONTAINER_NAME" >/dev/null 2>&1 || true
             fi
+            local DEB_CACHE_ROOT="$HOME/.cache/fedora-installer/deb"
+            local DEB_CACHE_DIR
+            local CONTAINER_DEB
+            mkdir -p "$DEB_CACHE_ROOT"
+            DEB_CACHE_DIR=$(mktemp -d "$DEB_CACHE_ROOT/install.XXXXXX")
+            CONTAINER_DEB="$DEB_CACHE_DIR/$BASENAME"
+            cp "$FILE" "$CONTAINER_DEB"
+            printf -v CONTAINER_DEB_Q "%q" "$CONTAINER_DEB"
+            printf -v APP_NAME_Q "%q" "$APP_NAME"
             echo "▸ Installing $BASENAME inside container…"
-            distrobox enter "$CONTAINER_NAME" -- bash -c "
-                sudo apt-get update -qq &&
-                sudo apt-get install -y \'$FILE\' 2>&1
-            "
+            if ! distrobox enter "$CONTAINER_NAME" -- bash -c \
+                "sudo apt-get update -qq && sudo apt-get install -y $CONTAINER_DEB_Q 2>&1"; then
+                rm -rf "$DEB_CACHE_DIR"
+                return 1
+            fi
+            rm -rf "$DEB_CACHE_DIR"
             echo "▸ Exporting app to host launcher…"
-            distrobox enter "$CONTAINER_NAME" -- bash -c "
-                distrobox-export --app \'$APP_NAME\' 2>/dev/null || true
-            "
+            distrobox enter "$CONTAINER_NAME" -- bash -c \
+                "distrobox-export --app $APP_NAME_Q 2>/dev/null || true"
             echo "✅ .deb installed via distrobox."
         }
 

@@ -521,6 +521,8 @@ def install_file(path: str, app_name_override: str | None, log,
     """
     if deb_method is None:
         deb_method = get_deb_method()
+    if deb_method not in ("distrobox", "alien"):
+        raise RuntimeError(f"Invalid .deb install method: {deb_method}")
     ftype = detect_type(path)
     app_name = app_name_override or app_name_from_path(path)
     # Sanitize: replace whitespace with hyphens for safe filesystem paths
@@ -585,43 +587,67 @@ def install_file(path: str, app_name_override: str | None, log,
     elif ftype == "deb":
         def _install_deb_distrobox():
             CONTAINER = "fedora-installer-debian"
+            memory = os.environ.get("FEDORA_INSTALLER_DEB_MEMORY", "3g")
+            memory_swap = os.environ.get("FEDORA_INSTALLER_DEB_MEMORY_SWAP", "5g")
             log("▸ Installing .deb via distrobox…")
-            if subprocess.run(["which", "distrobox"], capture_output=True).returncode != 0:
+            if shutil.which("distrobox") is None:
                 log("▸ distrobox not found — installing…")
                 proc = sudo_run(["dnf", "install", "-y", "distrobox", "podman"], stream=True)
                 if proc.returncode != 0:
                     raise RuntimeError("Failed to install distrobox.\n" + proc.stderr.decode(errors="replace"))
+            elif shutil.which("podman") is None and shutil.which("docker") is None:
+                log("▸ podman not found — installing…")
+                proc = sudo_run(["dnf", "install", "-y", "podman"], stream=True)
+                if proc.returncode != 0:
+                    raise RuntimeError("Failed to install podman.\n" + proc.stderr.decode(errors="replace"))
             existing = subprocess.run(["distrobox", "list"], capture_output=True, text=True)
             if CONTAINER not in existing.stdout:
                 log(f"▸ Creating Debian container '{CONTAINER}' (first time only — may take a minute)…")
                 proc = cancellable_run(
                     ["distrobox", "create", "--name", CONTAINER,
-                     "--image", "quay.io/toolbx-images/debian-toolbox:testing", "--yes"],
+                     "--image", "quay.io/toolbx-images/debian-toolbox:testing",
+                     "--additional-flags", f"--memory={memory} --memory-swap={memory_swap}",
+                     "--yes"],
                     token=cancel_token, log=log
                 )
                 if proc.returncode != 0:
                     raise RuntimeError("Failed to create distrobox container.\n" + proc.stderr.decode(errors="replace"))
+            elif shutil.which("podman") is not None:
+                subprocess.run(
+                    ["podman", "update", f"--memory={memory}",
+                     f"--memory-swap={memory_swap}", CONTAINER],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
             log(f"▸ Installing {os.path.basename(path)} inside container…")
-            install_cmd = f"sudo apt-get update -qq && sudo apt-get install -y {shlex.quote(path)}"
-            proc = cancellable_run(
-                ["distrobox", "enter", CONTAINER, "--", "bash", "-c", install_cmd],
-                token=cancel_token, log=log
-            )
-            if proc.returncode != 0:
-                raise RuntimeError("apt install failed inside container.\n" + proc.stderr.decode(errors="replace"))
+            cache_root = os.path.expanduser("~/.cache/fedora-installer/deb")
+            os.makedirs(cache_root, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix="install-", dir=cache_root) as cache_dir:
+                container_deb = os.path.join(cache_dir, os.path.basename(path))
+                shutil.copy2(path, container_deb)
+                install_cmd = (
+                    "sudo apt-get update -qq && "
+                    f"sudo apt-get install -y {shlex.quote(container_deb)}"
+                )
+                proc = cancellable_run(
+                    ["distrobox", "enter", CONTAINER, "--", "bash", "-c", install_cmd],
+                    token=cancel_token, log=log
+                )
+                if proc.returncode != 0:
+                    raise RuntimeError("apt install failed inside container.\n" + proc.stderr.decode(errors="replace"))
             log("▸ Exporting app to host launcher…")
-            export_cmd = f"distrobox-export --app \'{app_name}\' 2>/dev/null || true"
+            export_cmd = f"distrobox-export --app {shlex.quote(app_name)} 2>/dev/null || true"
             cancellable_run(["distrobox", "enter", CONTAINER, "--", "bash", "-c", export_cmd], token=cancel_token)
             log("✅ .deb installed via distrobox.")
 
         def _install_deb_alien():
             log("▸ Installing .deb via alien…")
-            if subprocess.run(["which", "alien"], capture_output=True).returncode != 0:
+            if shutil.which("alien") is None:
                 log("▸ alien not found — installing…")
                 proc = sudo_run(["dnf", "install", "-y", "alien"], stream=True)
                 if proc.returncode != 0:
                     raise RuntimeError("Failed to install alien.\n" + proc.stderr.decode(errors="replace"))
-            with tempfile.TemporaryDirectory() as tmpdir:
+            with tempfile.TemporaryDirectory(dir="/var/tmp") as tmpdir:
                 conv = cancellable_run(["alien", "--to-rpm", "--scripts", path], token=cancel_token, cwd=tmpdir, log=log)
                 if conv.returncode != 0:
                     raise RuntimeError("alien failed.\n" + conv.stderr.decode(errors="replace"))
