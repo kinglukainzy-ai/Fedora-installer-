@@ -283,3 +283,4 @@ This project is licensed under the **GNU General Public License v3.0** — see t
 ### v1.0.0
 
 - Initial release — GUI + CLI installer for `.rpm`, `.deb`, `.flatpak`, `.AppImage`, tarball, and `.zip`
+this was the start
